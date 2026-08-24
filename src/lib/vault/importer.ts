@@ -27,10 +27,10 @@ if (!process.env.NODE_TEST_CONTEXT) {
 /** The default vault:// refs this broker's built-in provider tools use (see providers.ts). */
 const DEFAULT_REFS: Array<{ provider: ProviderId; account: string }> = [
   { provider: "github", account: "echoomegaprime" },
-  { provider: "cloudflare", account: "echo" },
-  { provider: "openai", account: "primary" },
-  { provider: "stripe", account: "production" },
-  { provider: "xai", account: "primary" },
+  { provider: "cloudflare", account: "global_api_key" },
+  { provider: "openai", account: "api_key" },
+  { provider: "stripe", account: "secret_key" },
+  { provider: "xai", account: "api_key" },
 ];
 
 export interface ImportReport {

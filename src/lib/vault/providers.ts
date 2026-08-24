@@ -214,7 +214,7 @@ export async function cloudflareZoneGet(
   input: { credential_ref?: string; zone_id: string },
 ): Promise<ToolResult> {
   return useCredential(ctx, {
-    credential_ref: input.credential_ref ?? "vault://cloudflare/echo",
+    credential_ref: input.credential_ref ?? "vault://cloudflare/global_api_key",
     provider: "cloudflare",
     operation: "GET",
     resource: `/client/v4/zones/${encodeURIComponent(input.zone_id)}`,
@@ -226,7 +226,7 @@ export async function openaiAccountStatus(
   input: { credential_ref?: string } = {},
 ): Promise<ToolResult> {
   return useCredential(ctx, {
-    credential_ref: input.credential_ref ?? "vault://openai/primary",
+    credential_ref: input.credential_ref ?? "vault://openai/api_key",
     provider: "openai",
     operation: "GET",
     resource: "/v1/models",
@@ -238,7 +238,7 @@ export async function stripeBalance(
   input: { credential_ref?: string } = {},
 ): Promise<ToolResult> {
   return useCredential(ctx, {
-    credential_ref: input.credential_ref ?? "vault://stripe/production",
+    credential_ref: input.credential_ref ?? "vault://stripe/secret_key",
     provider: "stripe",
     operation: "GET",
     resource: "/v1/balance",
@@ -250,7 +250,7 @@ export async function xaiAccountStatus(
   input: { credential_ref?: string } = {},
 ): Promise<ToolResult> {
   return useCredential(ctx, {
-    credential_ref: input.credential_ref ?? "vault://xai/primary",
+    credential_ref: input.credential_ref ?? "vault://xai/api_key",
     provider: "xai",
     operation: "GET",
     resource: "/v1/models",

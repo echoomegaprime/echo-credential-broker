@@ -124,6 +124,18 @@ export async function vaultPut(
 }
 
 /**
+ * Doctrine-documented canonical vault names that a bare provider-id locate
+ * query does NOT surface (verified live 2026-08-24: `locate("github")`
+ * returns 7 legacy-clutter candidates and `GitHub_echoomegaprime_PAT` is not
+ * among them — the vault indexes exact historical names, not fuzzy matches).
+ * This is NOT a guess: it is the exact name doctrine names as "THE ONLY
+ * GITHUB ACCOUNT FOR NEW WORK". Keyed by `${provider}/${account}`.
+ */
+const CANONICAL_LOCATE_QUERY: Record<string, string> = {
+  "github/echoomegaprime": "GitHub_echoomegaprime_PAT",
+};
+
+/**
  * Resolve a (locate-query, account-hint) pair to ONE definite (service,
  * username) coordinate against the canonical vault. Never guesses across
  * AMBIGUOUS candidates without a matching hint — that is exactly the bug
@@ -135,7 +147,8 @@ export async function resolveCoordinate(
   accountHint: string,
   bypassReason: string,
 ): Promise<{ service: string; username: string } | null> {
-  const loc = await vaultLocate(locateQuery, bypassReason);
+  const canonical = CANONICAL_LOCATE_QUERY[`${locateQuery}/${accountHint}`];
+  const loc = await vaultLocate(canonical ?? locateQuery, bypassReason);
   if (loc.status === "EXACT" && loc.get_with) return loc.get_with;
   if (loc.status === "AMBIGUOUS") {
     const hint = accountHint.trim().toLowerCase();
