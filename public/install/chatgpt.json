@@ -1,0 +1,11 @@
+{
+  "name": "echo-credential-broker",
+  "mcp": {
+    "type": "http",
+    "url": "/api/mcp",
+    "headers": {
+      "x-echo-agent": "chatgpt"
+    }
+  },
+  "openapi": "/install/chatgpt.openapi.json"
+}

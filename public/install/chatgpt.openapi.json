@@ -1,0 +1,68 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Echo Credential Broker",
+    "version": "1.0.0",
+    "description": "MCP JSON-RPC for Echo Vault. Agents may USE credentials via vault:// references. Agents may NEVER READ credentials. There is no get_secret tool."
+  },
+  "servers": [
+    {
+      "url": "https://YOUR-HOST",
+      "description": "Replace with your deployed Echo Vault origin"
+    }
+  ],
+  "paths": {
+    "/api/mcp": {
+      "get": {
+        "operationId": "listBroker",
+        "summary": "List tools and invariant (never returns secrets)",
+        "parameters": [
+          {
+            "name": "x-echo-agent",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "enum": ["chatgpt", "grok", "claude"] }
+          }
+        ],
+        "responses": {
+          "200": { "description": "Tool catalog" }
+        }
+      },
+      "post": {
+        "operationId": "mcpCall",
+        "summary": "JSON-RPC initialize, tools/list, tools/call",
+        "parameters": [
+          {
+            "name": "x-echo-agent",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "default": "chatgpt" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "jsonrpc": { "type": "string", "enum": ["2.0"] },
+                  "id": {},
+                  "method": {
+                    "type": "string",
+                    "enum": ["initialize", "tools/list", "tools/call"]
+                  },
+                  "params": { "type": "object" }
+                },
+                "required": ["jsonrpc", "method"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "JSON-RPC result (redacted)" }
+        }
+      }
+    }
+  }
+}

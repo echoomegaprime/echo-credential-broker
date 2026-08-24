@@ -1,0 +1,14 @@
+{
+  "name": "echo-credential-broker",
+  "title": "Echo Vault",
+  "version": "1.0.0",
+  "description": "Agents may USE credentials. Agents may NEVER READ credentials.",
+  "mcp": {
+    "type": "http",
+    "url": "/api/mcp",
+    "headers": {
+      "x-echo-agent": "grok"
+    }
+  },
+  "instructions": "Call vault_list then credential_use / github_* tools with vault:// refs. Never ask for tokens."
+}

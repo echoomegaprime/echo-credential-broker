@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "echo-credential-broker": {
+      "command": "node",
+      "args": [
+        "--experimental-strip-types",
+        "scripts/mcp-stdio.ts"
+      ],
+      "cwd": "/ABSOLUTE/PATH/TO/echo-credential-broker",
+      "env": {
+        "ECHO_AGENT": "claude"
+      }
+    }
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "name": "echo-credential-broker",
+  "version": "1.0.0",
+  "description": "Echo Vault credential broker MCP",
+  "transport": {
+    "type": "http",
+    "endpoint": "/api/mcp"
+  },
+  "headers": {
+    "x-echo-agent": "grok"
+  }
+}
