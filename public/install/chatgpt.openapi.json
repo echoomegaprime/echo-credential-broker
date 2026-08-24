@@ -7,8 +7,8 @@
   },
   "servers": [
     {
-      "url": "https://YOUR-HOST",
-      "description": "Replace with your deployed Echo Vault origin"
+      "url": "https://credbroker.echo-op.com",
+      "description": "Canonical deployed Echo Vault origin (FORGE, Cloudflare tunnel)"
     }
   ],
   "paths": {
