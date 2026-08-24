@@ -42,17 +42,6 @@ export interface CredentialMetadata {
   source: string;
 }
 
-export interface StoredCredential {
-  meta: CredentialMetadata;
-  ciphertext: EncryptedBlob;
-}
-
-export interface EncryptedBlob {
-  alg: "aes-256-gcm";
-  iv: string;
-  tag: string;
-  ct: string;
-}
 
 export interface AuditRecord {
   id: string;

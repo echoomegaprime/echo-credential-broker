@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { afterEach, describe, it } from "node:test";
 import { CredentialStore } from "./store.ts";
+import { FakeVaultBackend } from "./backend.ts";
 import { useCredential } from "./broker.ts";
 import { safeJson } from "./redaction.ts";
 
@@ -15,8 +16,8 @@ describe("broker useCredential", () => {
   });
 
   it("injects Authorization internally and never returns it", async () => {
-    const store = new CredentialStore();
-    store.put({
+    const store = new CredentialStore(new FakeVaultBackend());
+    await store.put({
       provider: "github",
       account: "echoomegaprime",
       type: "pat",

@@ -104,6 +104,11 @@ process.stdin.on("data", (chunk: Buffer) => {
 });
 
 process.stdin.on("end", () => process.exit(0));
+if (!process.env.ECHO_SDK_API_KEY) {
+  process.stderr.write(
+    "echo-credential-broker WARNING: ECHO_SDK_API_KEY is not set — every vault tool call will fail closed (credential_unavailable) until it is configured.\n",
+  );
+}
 process.stderr.write(
   redactString(`echo-credential-broker stdio mcp ready caller=${caller}\n`),
 );

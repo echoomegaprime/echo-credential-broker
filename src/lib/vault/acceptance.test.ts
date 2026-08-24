@@ -9,6 +9,7 @@ import {
   safeJson,
 } from "./redaction.ts";
 import { CredentialStore } from "./store.ts";
+import { FakeVaultBackend } from "./backend.ts";
 import { callTool, vaultList } from "./tools.ts";
 import { useCredential } from "./broker.ts";
 import { assertSafeDestination } from "./policy.ts";
@@ -52,13 +53,16 @@ function assertNoTokenLeak(label: string, text: string): void {
 }
 
 describe("echo credential broker acceptance", () => {
-  const store = new CredentialStore();
+  // FakeVaultBackend — this describe block must NEVER touch the real gate:
+  // writing FAKE_PAT under vault://github/echoomegaprime with the real
+  // GateVaultBackend would overwrite the production GitHub credential.
+  const store = new CredentialStore(new FakeVaultBackend());
 
-  before(() => {
+  before(async () => {
     installCapture();
     registerSecretForRedaction(FAKE_PAT);
     registerSecretForRedaction(FAKE_GHP);
-    store.put({
+    await store.put({
       provider: "github",
       account: "echoomegaprime",
       type: "pat",

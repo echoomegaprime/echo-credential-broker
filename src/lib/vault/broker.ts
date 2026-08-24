@@ -45,23 +45,25 @@ function fail(error: string, credential_ref?: string, detail?: string): ToolFail
   });
 }
 
-function resolveOrFail(
+async function resolveOrFail(
   ctx: BrokerContext,
   credential_ref: string,
   provider: ProviderId,
-): { secret: string; meta: CredentialMetadata } | ToolFailure {
+): Promise<{ secret: string; meta: CredentialMetadata } | ToolFailure> {
   const parsed = parseVaultRef(credential_ref);
   if (!parsed) return fail("invalid_credential_ref", credential_ref);
   if (parsed.provider !== provider) {
     return fail("provider_mismatch", credential_ref);
   }
   const store = ctx.store ?? getStore();
+  // resolveSecret() alone re-discovers metadata for a not-yet-seen ref, so
+  // check status AFTER resolving, not before (a getMetadata()-first check
+  // would always miss on a fresh ref and report credential_unavailable).
+  const secret = await store.resolveSecret(parsed.raw);
   const meta = store.getMetadata(parsed.raw);
-  if (!meta || meta.status === "revoked") {
+  if (!secret || !meta || meta.status === "revoked") {
     return fail("credential_unavailable", parsed.raw);
   }
-  const secret = store.resolveSecret(parsed.raw);
-  if (!secret) return fail("credential_unavailable", parsed.raw);
   return { secret, meta };
 }
 
@@ -90,7 +92,7 @@ export async function useCredential(
     await ensureImported();
   }
 
-  const resolved = resolveOrFail(ctx, input.credential_ref, input.provider);
+  const resolved = await resolveOrFail(ctx, input.credential_ref, input.provider);
   if ("ok" in resolved && resolved.ok === false) {
     recordAudit({
       caller,

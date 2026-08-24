@@ -1,40 +1,36 @@
-import { readFile, readdir } from "node:fs/promises";
-import { join } from "node:path";
-import { registerSecretForRedaction, installProcessRedaction } from "./redaction.ts";
+/**
+ * Startup discovery — populates the broker's LOCAL METADATA cache (never
+ * secret material) for the default provider/account refs by locating them in
+ * the canonical Master Vault.
+ *
+ * This used to sweep raw secret VALUES out of env vars (`GITHUB_TOKEN`,
+ * `OPENAI_API_KEY`, ...) and `/tmp/grok/connectors/*.token` sandbox files
+ * into an in-memory store on every boot — a second, ephemeral, disconnected
+ * credential store. That store is gone (see store.ts); there is nothing left
+ * to import FROM locally. What used to be "import" is now "discover what
+ * Vault A already has for the refs this broker exposes" — a metadata-only
+ * locate() sweep, so `vault_status` / `vault_list` have something to show
+ * immediately at startup without requiring a secret fetch first.
+ *
+ * Exported names/shapes are UNCHANGED (`ensureImported`, `importSandboxCredentials`,
+ * `ImportReport { imported, skipped }`) so broker.ts / tools.ts need no changes.
+ */
+import { installProcessRedaction } from "./redaction.ts";
 import { getStore, type CredentialStore } from "./store.ts";
-import type { CredentialType, ProviderId } from "./types.ts";
-import { formatVaultRef } from "./refs.ts";
+import type { ProviderId } from "./types.ts";
+import { formatVaultRef, parseVaultRef } from "./refs.ts";
 
 if (!process.env.NODE_TEST_CONTEXT) {
   installProcessRedaction();
 }
 
-const CONNECTOR_DIR = "/tmp/grok/connectors";
-
-const ENV_SOURCES: Array<{
-  env: string;
-  provider: ProviderId;
-  account: string;
-  type: CredentialType;
-}> = [
-  { env: "GITHUB_TOKEN", provider: "github", account: "echoomegaprime", type: "pat" },
-  { env: "GH_TOKEN", provider: "github", account: "echoomegaprime", type: "pat" },
-  { env: "GITHUB_PAT", provider: "github", account: "echoomegaprime", type: "pat" },
-  { env: "OPENAI_API_KEY", provider: "openai", account: "primary", type: "api_key" },
-  {
-    env: "CLOUDFLARE_API_TOKEN",
-    provider: "cloudflare",
-    account: "echo",
-    type: "api_key",
-  },
-  {
-    env: "STRIPE_SECRET_KEY",
-    provider: "stripe",
-    account: "production",
-    type: "api_key",
-  },
-  { env: "STRIPE_API_KEY", provider: "stripe", account: "production", type: "api_key" },
-  { env: "XAI_API_KEY", provider: "xai", account: "primary", type: "api_key" },
+/** The default vault:// refs this broker's built-in provider tools use (see providers.ts). */
+const DEFAULT_REFS: Array<{ provider: ProviderId; account: string }> = [
+  { provider: "github", account: "echoomegaprime" },
+  { provider: "cloudflare", account: "echo" },
+  { provider: "openai", account: "primary" },
+  { provider: "stripe", account: "production" },
+  { provider: "xai", account: "primary" },
 ];
 
 export interface ImportReport {
@@ -42,105 +38,25 @@ export interface ImportReport {
   skipped: string[];
 }
 
-function looksLikeSecret(value: string): boolean {
-  const v = value.trim();
-  return v.length >= 16 && !v.includes("\n") && !v.startsWith("{");
-}
-
-async function readSecretFile(path: string): Promise<string | null> {
-  try {
-    const raw = await readFile(path, "utf8");
-    const trimmed = raw.trim();
-    if (!trimmed) return null;
-    if (trimmed.startsWith("{")) {
-      const parsed = JSON.parse(trimmed) as Record<string, unknown>;
-      for (const key of ["token", "password", "secret", "api_key", "pat"]) {
-        const val = parsed[key];
-        if (typeof val === "string" && looksLikeSecret(val)) {
-          registerSecretForRedaction(val);
-          return val.trim();
-        }
-      }
-      return null;
-    }
-    if (trimmed.includes("password=")) {
-      const line = trimmed
-        .split(/\r?\n/)
-        .find((l) => l.startsWith("password="));
-      if (line) {
-        const secret = line.slice("password=".length).trim();
-        registerSecretForRedaction(secret);
-        return secret;
-      }
-    }
-    if (looksLikeSecret(trimmed) || /^gh[pousr]_|^github_pat_|^sk-|^xai-/.test(trimmed)) {
-      registerSecretForRedaction(trimmed);
-      return trimmed;
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
-
+/**
+ * Locate metadata (not secrets) for the default refs against the canonical
+ * vault, registering whatever is found into the store's local cache.
+ */
 export async function importSandboxCredentials(
   store: CredentialStore = getStore(),
 ): Promise<ImportReport> {
   const imported: string[] = [];
   const skipped: string[] = [];
 
-  const githubToken = await readSecretFile(join(CONNECTOR_DIR, "github.token"));
-  if (githubToken) {
-    const ref = store.put({
-      provider: "github",
-      account: "echoomegaprime",
-      type: "pat",
-      secret: githubToken,
-      source: "sandbox:connectors/github.token",
-    });
-    imported.push(ref.ref);
-  } else {
-    skipped.push("sandbox:connectors/github.token");
-  }
-
-  try {
-    const files = await readdir(CONNECTOR_DIR);
-    for (const name of files) {
-      if (name === "github.token" || name === "index.json") continue;
-      if (!name.endsWith(".token")) continue;
-      const secret = await readSecretFile(join(CONNECTOR_DIR, name));
-      if (!secret) {
-        skipped.push(`sandbox:connectors/${name}`);
-        continue;
-      }
-      const providerGuess = name.replace(/\.token$/, "");
-      if (providerGuess === "github") continue;
-      skipped.push(`sandbox:connectors/${name}`);
-    }
-  } catch {
-    /* connector dir absent */
-  }
-
-  for (const src of ENV_SOURCES) {
-    const value = process.env[src.env];
-    if (!value || !looksLikeSecret(value)) {
-      skipped.push(`env:${src.env}`);
+  for (const { provider, account } of DEFAULT_REFS) {
+    const ref = formatVaultRef(provider, account);
+    const parsed = parseVaultRef(ref);
+    if (!parsed) {
+      skipped.push(ref);
       continue;
     }
-    const ref = formatVaultRef(src.provider, src.account);
-    if (store.has(ref) && src.provider === "github") {
-      skipped.push(`env:${src.env}`);
-      continue;
-    }
-    registerSecretForRedaction(value);
-    const meta = store.put({
-      provider: src.provider,
-      account: src.account,
-      type: src.type,
-      secret: value,
-      source: `env:${src.env}`,
-    });
-    imported.push(meta.ref);
+    const found = await store.has(ref); // has() auto-discovers metadata as a side effect
+    (found ? imported : skipped).push(ref);
   }
 
   return { imported: unique(imported), skipped: unique(skipped) };

@@ -312,7 +312,7 @@ export async function credentialHealth(
   if (!parsed) {
     return { ok: false, error: "invalid_credential_ref", credential_ref };
   }
-  if (!store.has(parsed.raw)) {
+  if (!(await store.has(parsed.raw))) {
     return { ok: false, error: "credential_unavailable", credential_ref: parsed.raw };
   }
   if (parsed.provider === "github") {
@@ -401,7 +401,7 @@ export async function credentialRevoke(
   if (!parsed) {
     return { ok: false, error: "invalid_credential_ref", credential_ref };
   }
-  const ok = store.revoke(parsed.raw);
+  const ok = await store.revoke(parsed.raw);
   if (!ok) {
     return { ok: false, error: "credential_unavailable", credential_ref: parsed.raw };
   }

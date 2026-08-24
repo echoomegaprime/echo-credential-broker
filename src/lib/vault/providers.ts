@@ -7,9 +7,9 @@ import type { ToolResult } from "./types.ts";
 
 const GITHUB_REF = "vault://github/echoomegaprime";
 
-function githubSecret(ctx: BrokerContext, ref: string): ToolResult<string> {
+async function githubSecret(ctx: BrokerContext, ref: string): Promise<ToolResult<string>> {
   const store = ctx.store ?? getStore();
-  const secret = store.resolveSecret(ref);
+  const secret = await store.resolveSecret(ref);
   if (!secret) {
     return { ok: false, error: "credential_unavailable", credential_ref: ref };
   }
@@ -20,7 +20,7 @@ export async function githubGetUser(
   ctx: BrokerContext,
   credential_ref = GITHUB_REF,
 ): Promise<ToolResult> {
-  const resolved = githubSecret(ctx, credential_ref);
+  const resolved = await githubSecret(ctx, credential_ref);
   if (!resolved.ok) return resolved;
   try {
     const result = await authorizedProviderFetch({
