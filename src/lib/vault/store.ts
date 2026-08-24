@@ -26,6 +26,7 @@
 import { registerSecretForRedaction } from "./redaction.ts";
 import { GateVaultBackend, type VaultBackend } from "./backend.ts";
 import { GateUnavailableError } from "./gate-client.ts";
+import { log } from "./log.ts";
 import type { CredentialMetadata, CredentialType, ProviderId } from "./types.ts";
 import { formatVaultRef, parseVaultRef } from "./refs.ts";
 
@@ -85,7 +86,18 @@ export class CredentialStore {
       source: input.source,
     };
     this.records.set(ref, { meta, coordinate: { service: input.provider, username: input.account } });
+    log.info("credential_put", { ref, provider: input.provider, account: input.account, source: input.source });
     return { ...meta };
+  }
+
+  /**
+   * Discovery only — raw locate candidates (service/username/key_shape),
+   * NEVER a secret. Lets a caller disambiguate across the vault's real
+   * accounts for a provider instead of being stuck with one hardcoded
+   * default, without ever fetching a value.
+   */
+  async find(query: string) {
+    return this.backend.search(query, BYPASS_REASON);
   }
 
   getMetadata(ref: string): CredentialMetadata | null {
@@ -119,7 +131,10 @@ export class CredentialStore {
     if (!parsed) return null;
     try {
       const coordinate = await this.backend.locate(parsed.provider, parsed.account, BYPASS_REASON);
-      if (!coordinate) return null;
+      if (!coordinate) {
+        log.debug("discover_not_found", { ref, provider: parsed.provider, account: parsed.account });
+        return null;
+      }
       const meta: CredentialMetadata = {
         ref,
         provider: parsed.provider,
@@ -132,9 +147,13 @@ export class CredentialStore {
       };
       const rec: LocalRecord = { meta, coordinate };
       this.records.set(ref, rec);
+      log.debug("discover_ok", { ref, resolved_service: coordinate.service, resolved_username: coordinate.username });
       return rec;
     } catch (err) {
-      if (err instanceof GateUnavailableError) return null; // fail closed, never fabricate
+      if (err instanceof GateUnavailableError) {
+        log.warn("discover_gate_unavailable", { ref, message: err.message });
+        return null; // fail closed, never fabricate
+      }
       return null;
     }
   }
@@ -182,6 +201,7 @@ export class CredentialStore {
     if (!rec) return false;
     rec.meta.status = "revoked";
     this.records.set(ref, rec);
+    log.warn("credential_revoked_local_quarantine", { ref });
     return true;
   }
 

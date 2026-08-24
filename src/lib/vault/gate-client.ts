@@ -14,9 +14,17 @@
  * `locate` returns coordinates, never a secret, and never picks for you.
  */
 
+import { log } from "./log.ts";
+
 const GATE_URL = (process.env.ECHO_SDK_GATE_URL || "https://forge.echo-op.com").replace(/\/+$/, "");
 const API_KEY = process.env.ECHO_SDK_API_KEY || "";
 const TIMEOUT_MS = 10_000;
+
+/** Safe-to-log view of gate params — `secret` is the one field that must never reach a log line. */
+function safeParams(params: Record<string, unknown>): Record<string, unknown> {
+  const { secret: _secret, ...rest } = params;
+  return rest;
+}
 
 export class GateUnavailableError extends Error {
   constructor(message: string) {
@@ -38,7 +46,9 @@ export interface GateEnvelope<T> {
  * silently make a live outage look like a missing credential).
  */
 async function invoke<T>(capability: string, params: Record<string, unknown>, bypassReason: string): Promise<T> {
+  const started = Date.now();
   if (!API_KEY) {
+    log.error("gate_call_no_key", { capability, params: safeParams(params) });
     throw new GateUnavailableError("ECHO_SDK_API_KEY is not configured — refusing to call the vault gate without auth.");
   }
   const controller = new AbortController();
@@ -56,14 +66,26 @@ async function invoke<T>(capability: string, params: Record<string, unknown>, by
       signal: controller.signal,
     });
     const envelope = (await res.json()) as GateEnvelope<T>;
+    const durationMs = Date.now() - started;
     if (!res.ok || envelope.status !== "ok" || envelope.result?.status_code < 200 || envelope.result?.status_code >= 300) {
+      log.warn("gate_call_failed", {
+        capability,
+        params: safeParams(params),
+        http_status: res.status,
+        envelope_status: envelope.status,
+        body_status: envelope.result?.status_code,
+        run_id: envelope.run_id,
+        duration_ms: durationMs,
+      });
       throw new GateUnavailableError(
         `vault gate call failed: ${capability} -> http ${res.status} / envelope ${envelope.status} / body ${envelope.result?.status_code}`,
       );
     }
+    log.debug("gate_call_ok", { capability, params: safeParams(params), run_id: envelope.run_id, duration_ms: durationMs });
     return envelope.result.body;
   } catch (error) {
     if (error instanceof GateUnavailableError) throw error;
+    log.error("gate_call_unreachable", { capability, params: safeParams(params), message: (error as Error).message, duration_ms: Date.now() - started });
     throw new GateUnavailableError(`vault gate unreachable calling ${capability}: ${(error as Error).message}`);
   } finally {
     clearTimeout(timer);

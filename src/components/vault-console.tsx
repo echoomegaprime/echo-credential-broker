@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Activity,
@@ -22,6 +22,7 @@ import {
   rpcAuditList,
   rpcCallTool,
   rpcListTools,
+  rpcRevealSecret,
   rpcVaultList,
   rpcVaultStatus,
 } from "@/lib/vault-rpc";
@@ -462,6 +463,7 @@ export function VaultConsole() {
                         </Button>
                       </div>
                     </div>
+                    <RevealSecret credRef={cred.ref} />
                   </Card>
                 ))
               )}
@@ -562,6 +564,83 @@ function Field({
     <div>
       <dt className="text-xs text-muted">{label}</dt>
       <dd className={cn("mt-1 break-all", mono && "font-mono text-xs")}>{value}</dd>
+    </div>
+  );
+}
+
+/**
+ * Human-only reveal + copy. Calls `rpcRevealSecret` (never an MCP tool — no
+ * agent can reach this path). The value lives only in this component's local
+ * state: never cached by React Query, never logged, auto-hidden after 30s or
+ * on unmount. Every reveal is separately audited server-side as `human_reveal`.
+ */
+function RevealSecret({ credRef }: { credRef: string }) {
+  const [state, setState] = useState<
+    | { phase: "hidden" }
+    | { phase: "loading" }
+    | { phase: "shown"; value: string }
+    | { phase: "error"; message: string }
+  >({ phase: "hidden" });
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    if (state.phase !== "shown") return;
+    const t = setTimeout(() => setState({ phase: "hidden" }), 30_000);
+    return () => clearTimeout(t);
+  }, [state.phase]);
+
+  const reveal = async () => {
+    setState({ phase: "loading" });
+    try {
+      const res = await rpcRevealSecret({ data: { credential_ref: credRef } });
+      if (res.ok) setState({ phase: "shown", value: res.secret });
+      else setState({ phase: "error", message: res.error });
+    } catch {
+      setState({ phase: "error", message: "request_failed" });
+    }
+  };
+
+  const copy = async () => {
+    if (state.phase !== "shown") return;
+    await navigator.clipboard.writeText(state.value);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  if (state.phase === "hidden" || state.phase === "loading") {
+    return (
+      <Button variant="secondary" size="sm" onClick={reveal} disabled={state.phase === "loading"}>
+        <KeyRound className="size-3.5" />
+        {state.phase === "loading" ? "Revealing…" : "Reveal"}
+      </Button>
+    );
+  }
+
+  if (state.phase === "error") {
+    return (
+      <div className="mt-3 flex items-center gap-2 text-sm text-danger">
+        <span>Reveal failed: {state.message}</span>
+        <Button variant="ghost" size="sm" onClick={() => setState({ phase: "hidden" })}>
+          Dismiss
+        </Button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mt-3 flex flex-wrap items-center gap-2 rounded-md bg-bg p-3 shadow-[0_0_0_1px_var(--color-border)]">
+      <code className="min-w-0 flex-1 select-all break-all font-mono text-xs text-fg">
+        {state.value}
+      </code>
+      <Button variant="secondary" size="sm" onClick={copy}>
+        {copied ? "Copied" : "Copy"}
+      </Button>
+      <Button variant="ghost" size="sm" onClick={() => setState({ phase: "hidden" })}>
+        Hide
+      </Button>
+      <span className="basis-full text-[11px] text-subtle">
+        Auto-hides in 30s · this reveal is audited
+      </span>
     </div>
   );
 }

@@ -49,6 +49,16 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
+    name: "vault_find",
+    description:
+      "Search the canonical vault for candidate credentials matching a name (e.g. a vendor). Returns service/username candidates only — never a secret. Use this to discover the right account before calling a tool with an explicit credential_ref.",
+    inputSchema: {
+      type: "object",
+      properties: { query: { type: "string" } },
+      required: ["query"],
+    },
+  },
+  {
     name: "vault_metadata",
     description: "Return metadata for a single vault:// reference. Never returns the secret.",
     inputSchema: {
@@ -285,6 +295,23 @@ export async function vaultList(ctx: BrokerContext): Promise<ToolResult> {
   });
 }
 
+export async function vaultFind(ctx: BrokerContext, query: string): Promise<ToolResult> {
+  const store = ctx.store ?? getStore();
+  if (!query || query.trim().length < 2) {
+    return { ok: false, error: "query_too_short" };
+  }
+  const result = await store.find(query.trim());
+  return redactValue({
+    ok: true as const,
+    data: {
+      status: result.status,
+      candidates: result.candidates.map((c) => ({ service: c.actual_service, username: c.username, key_shape: c.key_shape })),
+      hint: result.hint ?? null,
+      did_you_mean: result.did_you_mean ?? [],
+    },
+  });
+}
+
 export async function vaultMetadata(
   ctx: BrokerContext,
   credential_ref: string,
@@ -436,6 +463,8 @@ export async function callTool(
         return await vaultStatus(ctx);
       case "vault_list":
         return await vaultList(ctx);
+      case "vault_find":
+        return await vaultFind(ctx, String(a.query ?? ""));
       case "vault_metadata":
         return await vaultMetadata(ctx, String(a.credential_ref ?? ""));
       case "credential_health":

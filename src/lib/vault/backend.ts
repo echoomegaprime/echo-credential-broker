@@ -6,13 +6,23 @@
  * throwaway test secret under a real ref like `vault://github/echoomegaprime`
  * would clobber the actual credential every other service depends on).
  */
-import { resolveCoordinate, vaultGet, vaultPut, type GetResult, type PutResult } from "./gate-client.ts";
+import {
+  resolveCoordinate,
+  vaultGet,
+  vaultLocate,
+  vaultPut,
+  type GetResult,
+  type LocateResult,
+  type PutResult,
+} from "./gate-client.ts";
 
 export interface VaultBackend {
   put(service: string, username: string, secret: string, note: string, bypassReason: string): Promise<PutResult>;
   get(service: string, username: string, bypassReason: string): Promise<GetResult>;
   /** Locate-then-resolve a definite (service, username) coordinate, or null if not found/ambiguous. */
   locate(locateQuery: string, accountHint: string, bypassReason: string): Promise<{ service: string; username: string } | null>;
+  /** Raw locate result (status + every candidate's service/username, never a secret) for discovery. */
+  search(query: string, bypassReason: string): Promise<LocateResult>;
 }
 
 export class GateVaultBackend implements VaultBackend {
@@ -24,6 +34,9 @@ export class GateVaultBackend implements VaultBackend {
   }
   locate(locateQuery: string, accountHint: string, bypassReason: string) {
     return resolveCoordinate(locateQuery, accountHint, bypassReason);
+  }
+  search(query: string, bypassReason: string) {
+    return vaultLocate(query, bypassReason);
   }
 }
 
@@ -53,5 +66,19 @@ export class FakeVaultBackend implements VaultBackend {
       return { service: locateQuery, username: accountHint };
     }
     return null;
+  }
+
+  async search(query: string, _bypassReason: string) {
+    const candidates = [...this.secrets.keys()]
+      .filter((k) => k.startsWith(`${query}/`))
+      .map((k) => {
+        const [service, username] = k.split("/");
+        return { actual_service: service, username, key_shape: "fake" };
+      });
+    if (candidates.length === 0) return { status: "NOT_FOUND" as const, service: query, candidates: [], did_you_mean: [] };
+    if (candidates.length === 1) {
+      return { status: "EXACT" as const, service: query, candidates, get_with: { service: candidates[0].actual_service, username: candidates[0].username } };
+    }
+    return { status: "AMBIGUOUS" as const, service: query, count: candidates.length, candidates };
   }
 }

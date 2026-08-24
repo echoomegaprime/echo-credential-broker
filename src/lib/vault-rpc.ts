@@ -133,6 +133,53 @@ export const rpcListTools = createServerFn({ method: "GET" }).handler(
   },
 );
 
+/**
+ * HUMAN-ONLY secret reveal — deliberately NOT an MCP tool and NOT reachable
+ * from `/api/mcp`. This is the one legitimate place a raw secret crosses the
+ * server/client boundary: the Commander asking the console, in his own
+ * browser, to show him a credential so he can copy/paste it somewhere. No
+ * agent (Claude/GPT/Grok/Codex) has any tool that calls this — the MCP tool
+ * surface (`vault/tools.ts`) still has zero `get_secret`-shaped tool and
+ * never will. Every reveal is audited as a distinct `human_reveal` operation.
+ *
+ * Trust boundary today: same as every other console/MCP operation on this
+ * broker — reachable to whoever can reach the FORGE LAN port. `provider_request`
+ * / `credential_use` already let any caller on that boundary perform an
+ * authenticated action with any vault credential, so a reveal is not a wider
+ * blast radius than what already exists ungated. Real per-user login is a
+ * natural hardening step if this ever needs a *tighter* boundary than that.
+ */
+export const rpcRevealSecret = createServerFn({ method: "POST" })
+  .validator((data: { credential_ref: string }) => ({
+    credential_ref: String(data.credential_ref),
+  }))
+  .handler(async ({ data }): Promise<{ ok: true; secret: string } | { ok: false; error: string }> => {
+    const { getStore } = await import("./vault/store.ts");
+    const { recordAudit } = await import("./vault/audit.ts");
+    const { parseVaultRef } = await import("./vault/refs.ts");
+    const started = Date.now();
+    const parsed = parseVaultRef(data.credential_ref);
+    if (!parsed) return { ok: false, error: "invalid_credential_ref" };
+    const store = getStore();
+    const secret = await store.resolveSecret(parsed.raw);
+    recordAudit({
+      caller: "vault-console:human",
+      credential_ref: parsed.raw,
+      provider: parsed.provider,
+      operation: "human_reveal",
+      resource: parsed.raw,
+      http_status: null,
+      duration_ms: Date.now() - started,
+      result: secret ? "ok" : "error",
+      error: secret ? undefined : "credential_unavailable",
+    });
+    if (!secret) return { ok: false, error: "credential_unavailable" };
+    // Deliberately bypassed: asRpc()/redactValue()/safeJson() elsewhere in this
+    // file exist to STRIP secrets from every other response. This is the one
+    // response that must carry the real value, so it must never pass through them.
+    return { ok: true, secret };
+  });
+
 export const rpcCallTool = createServerFn({ method: "POST" })
   .validator((data: { name: string; arguments?: ToolArgs; argsJson?: string }) => ({
     name: String(data.name),
