@@ -1,0 +1,14 @@
+{
+  "enabled": false,
+  "issuer": "UNCONFIGURED_OWNER_ADMISSION_ISSUER",
+  "key_id": "UNCONFIGURED_EXISTING_OWNER_KEY_ID",
+  "public_key_pem": "",
+  "claims_dir": "/var/lib/echo-credential-broker/sdk-operator/claims",
+  "principal": {
+    "actor": "UNCONFIGURED_EXACT_ADMITTED_ACTOR",
+    "mission_id": "UNCONFIGURED_EXISTING_MISSION",
+    "credential_sha256": "",
+    "credential": {"service": "UNCONFIGURED_EXISTING_SCOPED_SDK_CREDENTIAL", "username": "UNCONFIGURED"},
+    "capabilities": []
+  }
+}

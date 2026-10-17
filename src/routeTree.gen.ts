@@ -11,6 +11,7 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as ApiMcpRouteImport } from './routes/api/mcp'
+import { Route as ApiRestToolRouteImport } from './routes/api/rest/tool'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -22,31 +23,40 @@ const ApiMcpRoute = ApiMcpRouteImport.update({
   path: '/api/mcp',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ApiRestToolRoute = ApiRestToolRouteImport.update({
+  id: '/api/rest/tool',
+  path: '/api/rest/tool',
+  getParentRoute: () => rootRouteImport,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/api/mcp': typeof ApiMcpRoute
+  '/api/rest/tool': typeof ApiRestToolRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/api/mcp': typeof ApiMcpRoute
+  '/api/rest/tool': typeof ApiRestToolRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/api/mcp': typeof ApiMcpRoute
+  '/api/rest/tool': typeof ApiRestToolRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/api/mcp'
+  fullPaths: '/' | '/api/mcp' | '/api/rest/tool'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/api/mcp'
-  id: '__root__' | '/' | '/api/mcp'
+  to: '/' | '/api/mcp' | '/api/rest/tool'
+  id: '__root__' | '/' | '/api/mcp' | '/api/rest/tool'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   ApiMcpRoute: typeof ApiMcpRoute
+  ApiRestToolRoute: typeof ApiRestToolRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -65,12 +75,20 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiMcpRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/api/rest/tool': {
+      id: '/api/rest/tool'
+      path: '/api/rest/tool'
+      fullPath: '/api/rest/tool'
+      preLoaderRoute: typeof ApiRestToolRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   ApiMcpRoute: ApiMcpRoute,
+  ApiRestToolRoute: ApiRestToolRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
