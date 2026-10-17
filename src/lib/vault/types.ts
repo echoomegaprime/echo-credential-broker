@@ -72,6 +72,9 @@ export interface ToolSuccess<T = unknown> {
 export type ToolResult<T = unknown> = ToolSuccess<T> | ToolFailure;
 
 export const FORBIDDEN_TOOLS = [
+  // Private operator actions must never inherit public caller-label authority.
+  "sdk_action_review",
+  "sdk_operator_execute",
   "get_secret",
   "get_token",
   "get_pat",

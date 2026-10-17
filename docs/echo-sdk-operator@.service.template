@@ -1,0 +1,31 @@
+# STAGED TEMPLATE ONLY. Substitute the independently certified exact source SHA.
+# Install only through the actual owner-controlled release process.
+[Unit]
+Description=ECHO exact-request SDK operator job %i
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/opt/echo-credential-broker-operator/@SOURCE_SHA@
+ExecStart=/usr/bin/node --experimental-strip-types /opt/echo-credential-broker-operator/@SOURCE_SHA@/scripts/sdk-operator.ts execute %i
+Environment=ECHO_SDK_GATE_URL=http://127.0.0.1:8000
+# This pre-existing owner-managed secure injection file is NOT supplied here.
+EnvironmentFile=/etc/echo/credential-broker/operator-vault-access.env
+UnsetEnvironment=NODE_OPTIONS NODE_PATH LD_PRELOAD LD_LIBRARY_PATH HTTP_PROXY HTTPS_PROXY ALL_PROXY NODE_USE_ENV_PROXY
+TimeoutStartSec=55
+UMask=0077
+NoNewPrivileges=true
+CapabilityBoundingSet=
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/echo-credential-broker/sdk-operator/claims
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+StandardOutput=journal
+StandardError=journal
