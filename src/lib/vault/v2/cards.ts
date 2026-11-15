@@ -22,9 +22,16 @@
  *             The agent only ever sees {card_id, status, expires_at} and, once
  *             completed, the entry's metadata.
  *
- * Deleting an entry is a soft delete: the canonical vault has no delete (a
- * fleet-wide hard limit, see store.ts), so the per-entry vault key is orphaned,
- * never read again by this module, and can be purged only by a Vault A operation.
+ * deleteEntry is the reversible SOFT delete (status → deleted; the secret is
+ * untouched). The irreversible step is rotation.ts → purgeEntry: it destroys the
+ * stored secret (backend delete where one exists, otherwise an overwrite with
+ * random bytes — the canonical vault has no delete, see store.ts) and then
+ * hard-deletes the row, its cards and its grants.
+ *
+ * Rotation state (migrations/0007): rotation_mode, rotate_interval_days,
+ * last_rotated_at, rotate_by, rotation_count, last_rotation_error and the
+ * non-secret provider_token_id. A completed card re-entry counts as a manual
+ * rotation; auto-rotation lives in rotation.ts.
  */
 import { createHash, randomBytes } from "node:crypto";
 import type { Sql } from "../../db.ts";
@@ -39,6 +46,7 @@ import { appendLedger } from "./ledger.ts";
 
 export type EntryKind = "password" | "api_key" | "oauth_token" | "operator_secret";
 export type EntryStatus = "active" | "needs_reentry" | "deleted";
+export type RotationMode = "manual" | "auto";
 
 export const ENTRY_KINDS: readonly EntryKind[] = ["password", "api_key", "oauth_token", "operator_secret"];
 
@@ -63,6 +71,19 @@ export interface EntryMetadata {
   last_used_at: string | null;
   last_verified_at: string | null;
   reentry_reason?: string;
+  /** "manual": the owner re-enters the secret on a card. "auto": a provider rotator rolls it (rotation.ts). */
+  rotation_mode: RotationMode;
+  /** Rotate every N days (1..3650); null = no schedule. */
+  rotate_interval_days: number | null;
+  /** Last successful rotation (card re-entry or auto-rotate). */
+  last_rotated_at: string | null;
+  /** When the next rotation is due; null = never. */
+  rotate_by: string | null;
+  rotation_count: number;
+  /** Short code of the last failed rotation attempt (never provider text); cleared by a success. */
+  last_rotation_error: string | null;
+  /** Provider-side NON-SECRET id needed to rotate (e.g. a Cloudflare API token id). Never a token value. */
+  provider_token_id: string | null;
 }
 
 export type CardStoredStatus = "pending" | "claimed" | "completed" | "expired";
@@ -120,6 +141,10 @@ const CARD_ID_PATTERN = /^vc_[0-9a-f]{32}$/;
 const SITE_PATTERN = /^(?=.{1,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$/;
 const ACCOUNT_PATTERN = /^[\x21-\x7e]{1,254}$/;
 const PURPOSE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9 ._:@/+-]{0,63}$/;
+const PROVIDER_TOKEN_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
+const ROTATION_ERROR_PATTERN = /^[a-z0-9_]{1,64}$/;
+export const MAX_ROTATE_INTERVAL_DAYS = 3650;
+const DAY_MS = 86_400_000;
 const DEFAULT_PURPOSE = "general";
 const BACKEND_USERNAME = "entry";
 const BYPASS_REASON =
@@ -223,9 +248,29 @@ function publicEntry(row: EntryMetadata): EntryMetadata {
     updated_at: row.updated_at,
     last_used_at: row.last_used_at,
     last_verified_at: row.last_verified_at,
+    rotation_mode: row.rotation_mode,
+    rotate_interval_days: row.rotate_interval_days,
+    last_rotated_at: row.last_rotated_at,
+    rotate_by: row.rotate_by,
+    rotation_count: row.rotation_count,
+    last_rotation_error: row.last_rotation_error,
+    provider_token_id: row.provider_token_id,
   };
   if (row.reentry_reason) out.reentry_reason = row.reentry_reason;
   return out;
+}
+
+/** `fromIso` + N days, or null when there is no interval. */
+function rotateByFrom(fromIso: string, intervalDays: number | null): string | null {
+  return intervalDays === null ? null : new Date(Date.parse(fromIso) + intervalDays * DAY_MS).toISOString();
+}
+
+/** Full replacement values for an entry's rotation policy (computed by setRotationPolicy). */
+export interface RotationPolicyRow {
+  rotation_mode: RotationMode;
+  rotate_interval_days: number | null;
+  provider_token_id: string | null;
+  rotate_by: string | null;
 }
 
 // ---------------------------------------------------------------- entry storage
@@ -257,11 +302,23 @@ export interface EntryStore {
     patch: { account?: string; purpose?: string; label?: string; last_verified_at?: string },
     nowIso: string,
   ): Promise<EntryMetadata | null>;
-  /** New fingerprint/length for the same id; status → active, re-entry reason cleared, verification reset. */
+  /**
+   * New fingerprint/length for the same id; status → active, re-entry reason cleared, verification reset.
+   * This IS a rotation: last_rotated_at = now, rotation_count + 1, rotate_by = now + interval (or null),
+   * last_rotation_error cleared.
+   */
   replaceSecretMeta(id: string, fingerprint: string, secretLength: number, nowIso: string): Promise<EntryMetadata | null>;
   flag(id: string, reason: string, nowIso: string): Promise<EntryMetadata | null>;
   markDeleted(id: string, nowIso: string): Promise<EntryMetadata | null>;
   touchUsed(id: string, nowIso: string): Promise<EntryMetadata | null>;
+  /** Replace the rotation policy columns. Null when missing/deleted. */
+  setRotation(id: string, policy: RotationPolicyRow, nowIso: string): Promise<EntryMetadata | null>;
+  /** Record (or clear, with null) the short code of a failed rotation attempt. */
+  setRotationError(id: string, code: string | null, nowIso: string): Promise<EntryMetadata | null>;
+  /** Active entries whose rotate_by <= nowIso, oldest due first. */
+  listRotationDue(nowIso: string): Promise<EntryMetadata[]>;
+  /** Remove the row itself (any status). True when a row was removed. Callers destroy the secret FIRST. */
+  hardDelete(id: string): Promise<boolean>;
 }
 
 function sortEntries(rows: EntryMetadata[]): EntryMetadata[] {
@@ -310,6 +367,13 @@ export class MemoryEntryStore implements EntryStore {
       updated_at: row.nowIso,
       last_used_at: null,
       last_verified_at: null,
+      rotation_mode: "manual",
+      rotate_interval_days: null,
+      last_rotated_at: null,
+      rotate_by: null,
+      rotation_count: 0,
+      last_rotation_error: null,
+      provider_token_id: null,
     };
     this.rows.set(rec.id, rec);
     return { ...rec };
@@ -378,6 +442,10 @@ export class MemoryEntryStore implements EntryStore {
     rec.status = "active";
     delete rec.reentry_reason;
     rec.last_verified_at = null;
+    rec.last_rotated_at = nowIso;
+    rec.rotation_count += 1;
+    rec.rotate_by = rotateByFrom(nowIso, rec.rotate_interval_days);
+    rec.last_rotation_error = null;
     rec.updated_at = nowIso;
     return { ...rec };
   }
@@ -407,6 +475,37 @@ export class MemoryEntryStore implements EntryStore {
     return { ...rec };
   }
 
+  async setRotation(id: string, policy: RotationPolicyRow, nowIso: string): Promise<EntryMetadata | null> {
+    const rec = this.rows.get(id);
+    if (!rec || rec.status === "deleted") return null;
+    rec.rotation_mode = policy.rotation_mode;
+    rec.rotate_interval_days = policy.rotate_interval_days;
+    rec.provider_token_id = policy.provider_token_id;
+    rec.rotate_by = policy.rotate_by;
+    rec.updated_at = nowIso;
+    return { ...rec };
+  }
+
+  async setRotationError(id: string, code: string | null, nowIso: string): Promise<EntryMetadata | null> {
+    const rec = this.rows.get(id);
+    if (!rec || rec.status === "deleted") return null;
+    rec.last_rotation_error = code;
+    rec.updated_at = nowIso;
+    return { ...rec };
+  }
+
+  async listRotationDue(nowIso: string): Promise<EntryMetadata[]> {
+    const now = Date.parse(nowIso);
+    return [...this.rows.values()]
+      .filter((r) => r.status === "active" && r.rotate_by !== null && Date.parse(r.rotate_by) <= now)
+      .sort((a, b) => Date.parse(a.rotate_by as string) - Date.parse(b.rotate_by as string) || a.id.localeCompare(b.id))
+      .map((r) => ({ ...r }));
+  }
+
+  async hardDelete(id: string): Promise<boolean> {
+    return this.rows.delete(id);
+  }
+
   /** TEST ONLY: every stored row, for leak scans. */
   dumpForTests(): EntryMetadata[] {
     return [...this.rows.values()].map((r) => ({ ...r }));
@@ -428,7 +527,8 @@ function violates(err: unknown, constraint: string): boolean {
 
 const ENTRY_COLUMNS =
   "id, site, account, purpose, label, kind, is_default, status, fingerprint, secret_length, reentry_reason, " +
-  "created_at, updated_at, last_used_at, last_verified_at";
+  "created_at, updated_at, last_used_at, last_verified_at, rotation_mode, rotate_interval_days, last_rotated_at, " +
+  "rotate_by, rotation_count, last_rotation_error, provider_token_id";
 
 function rowToEntry(row: Record<string, unknown>): EntryMetadata {
   const rec: EntryMetadata = {
@@ -447,6 +547,13 @@ function rowToEntry(row: Record<string, unknown>): EntryMetadata {
     updated_at: toIso(row.updated_at),
     last_used_at: toIsoOrNull(row.last_used_at),
     last_verified_at: toIsoOrNull(row.last_verified_at),
+    rotation_mode: row.rotation_mode === "auto" ? "auto" : "manual",
+    rotate_interval_days: row.rotate_interval_days == null ? null : Number(row.rotate_interval_days),
+    last_rotated_at: toIsoOrNull(row.last_rotated_at),
+    rotate_by: toIsoOrNull(row.rotate_by),
+    rotation_count: Number(row.rotation_count ?? 0),
+    last_rotation_error: row.last_rotation_error == null ? null : String(row.last_rotation_error),
+    provider_token_id: row.provider_token_id == null ? null : String(row.provider_token_id),
   };
   if (row.reentry_reason != null && row.reentry_reason !== "") rec.reentry_reason = String(row.reentry_reason);
   return rec;
@@ -565,7 +672,10 @@ export class SqlEntryStore implements EntryStore {
     return this.one(
       `update vault_entries
           set fingerprint = $2::text, secret_length = $3::integer, status = 'active', reentry_reason = null,
-              last_verified_at = null, updated_at = $4::timestamptz
+              last_verified_at = null, updated_at = $4::timestamptz,
+              last_rotated_at = $4::timestamptz, rotation_count = rotation_count + 1, last_rotation_error = null,
+              rotate_by = case when rotate_interval_days is null then null
+                               else $4::timestamptz + make_interval(days => rotate_interval_days) end
         where id = $1::text and status <> 'deleted'
         returning ${ENTRY_COLUMNS}`,
       [id, fingerprint, secretLength, nowIso],
@@ -600,6 +710,41 @@ export class SqlEntryStore implements EntryStore {
       [id, nowIso],
     );
   }
+
+  setRotation(id: string, policy: RotationPolicyRow, nowIso: string): Promise<EntryMetadata | null> {
+    return this.one(
+      `update vault_entries
+          set rotation_mode = $2::text, rotate_interval_days = $3::integer, provider_token_id = $4::text,
+              rotate_by = $5::timestamptz, updated_at = $6::timestamptz
+        where id = $1::text and status <> 'deleted'
+        returning ${ENTRY_COLUMNS}`,
+      [id, policy.rotation_mode, policy.rotate_interval_days, policy.provider_token_id, policy.rotate_by, nowIso],
+    );
+  }
+
+  setRotationError(id: string, code: string | null, nowIso: string): Promise<EntryMetadata | null> {
+    return this.one(
+      `update vault_entries set last_rotation_error = $2::text, updated_at = $3::timestamptz
+        where id = $1::text and status <> 'deleted'
+        returning ${ENTRY_COLUMNS}`,
+      [id, code, nowIso],
+    );
+  }
+
+  async listRotationDue(nowIso: string): Promise<EntryMetadata[]> {
+    const rows = await (await this.sql()).query<Record<string, unknown>>(
+      `select ${ENTRY_COLUMNS} from vault_entries
+        where status = 'active' and rotate_by is not null and rotate_by <= $1::timestamptz
+        order by rotate_by asc, id asc`,
+      [nowIso],
+    );
+    return rows.map(rowToEntry);
+  }
+
+  async hardDelete(id: string): Promise<boolean> {
+    const rows = await (await this.sql()).query("delete from vault_entries where id = $1::text returning id", [id]);
+    return rows.length === 1;
+  }
 }
 
 // ---------------------------------------------------------------- card storage
@@ -618,6 +763,8 @@ export interface CardStore {
   complete(id: string, entryId: string, nowIso: string): Promise<boolean>;
   /** pending|claimed → expired. */
   expire(id: string): Promise<void>;
+  /** Remove every card that points at this entry (purge; vault_cards.entry_id references vault_entries). */
+  deleteForEntry(entryId: string): Promise<number>;
 }
 
 export class MemoryCardStore implements CardStore {
@@ -672,6 +819,14 @@ export class MemoryCardStore implements CardStore {
   async expire(id: string): Promise<void> {
     const rec = this.rows.get(id);
     if (rec && (rec.status === "pending" || rec.status === "claimed")) rec.status = "expired";
+  }
+
+  async deleteForEntry(entryId: string): Promise<number> {
+    let n = 0;
+    for (const [id, rec] of this.rows) {
+      if (rec.entry_id === entryId && this.rows.delete(id)) n += 1;
+    }
+    return n;
   }
 
   /** TEST ONLY: every stored row, for leak scans. */
@@ -793,6 +948,13 @@ export class SqlCardStore implements CardStore {
       [id],
     );
   }
+
+  async deleteForEntry(entryId: string): Promise<number> {
+    const rows = await (await this.sql()).query("delete from vault_cards where entry_id = $1::text returning id", [
+      entryId,
+    ]);
+    return rows.length;
+  }
 }
 
 // ---------------------------------------------------------------- wiring
@@ -895,6 +1057,138 @@ async function writeLedger(c: Ctx, input: EntryLedgerInput, mustSucceed: boolean
     log.error("vault_entry_ledger_failed", { capability: input.capability, client_id: input.client_id });
     if (mustSucceed) throw new EntryError("ledger_unavailable", "The action could not be recorded in the ledger");
   }
+}
+
+/**
+ * The ONE place an entry's secret is read from the backend (useEntry, and
+ * rotation.ts through openEntryVault). Arms the value for redaction before
+ * returning it. Throws EntryError("entry_secret_missing" | "vault_unavailable").
+ */
+async function loadEntrySecret(c: Ctx, row: EntryMetadata): Promise<string> {
+  let secret: string;
+  try {
+    const backend = await c.backend();
+    const coordinate = await backend.locate(backendService(row.id), BACKEND_USERNAME, BYPASS_REASON);
+    if (!coordinate) throw new EntryError("entry_secret_missing", "The vault has no secret for this entry");
+    const got = await backend.get(coordinate.service, coordinate.username, BYPASS_REASON);
+    if (typeof got?.secret !== "string" || got.secret.length === 0) {
+      throw new EntryError("entry_secret_missing", "The vault has no secret for this entry");
+    }
+    secret = got.secret;
+  } catch (err) {
+    if (err instanceof EntryError) throw err;
+    throw new EntryError("vault_unavailable", "The vault could not be reached");
+  }
+  registerSecretForRedaction(secret);
+  if (secretFingerprint(secret) !== row.fingerprint) {
+    log.warn("vault_entry_fingerprint_drift", { entry_id: row.id });
+  }
+  return secret;
+}
+
+async function storeEntrySecret(c: Ctx, row: Pick<EntryMetadata, "id" | "site" | "account" | "purpose" | "kind">, secret: string): Promise<void> {
+  registerSecretForRedaction(secret);
+  try {
+    const backend = await c.backend();
+    const put = await backend.put(
+      backendService(row.id),
+      BACKEND_USERNAME,
+      secret,
+      `echo-credential-broker vault v2 entry: ${entryLabel(row.site, row.account, row.purpose)} (${row.kind})`,
+      BYPASS_REASON,
+    );
+    if (put && put.stored === false) throw new Error("not stored");
+  } catch {
+    throw new EntryError("vault_unavailable", "vault write failed");
+  }
+}
+
+/**
+ * SERVER-INTERNAL seam for rotation.ts (auto-rotate and purge). It hands out the
+ * same stores, clock, ledger sink and backend access that useEntry/submitCard
+ * use, so rotation never grows a second, weaker copy of the secret path.
+ * `readSecret` returns a secret VALUE: it must only ever be called by code that
+ * keeps it inside the process (provider request → backend put). Never wire this
+ * to a tool, a route or a log line.
+ */
+export interface EntryVault {
+  entries: EntryStore;
+  cards: CardStore;
+  nowMs: number;
+  nowIso: string;
+  /** Write a ledger row; with mustSucceed a failure throws EntryError("ledger_unavailable"). */
+  ledger(input: EntryLedgerInput, mustSucceed: boolean): Promise<void>;
+  readSecret(row: EntryMetadata): Promise<string>;
+  /** `put` the secret under the entry's backend key. Throws EntryError("vault_unavailable"). */
+  writeSecret(row: EntryMetadata, secret: string): Promise<void>;
+  /**
+   * Destroy the stored secret: backend.delete when the backend has one,
+   * otherwise overwrite it with 64 random bytes (base64url) and read it back to
+   * confirm the original value is gone. Throws EntryError("vault_unavailable" |
+   * "purge_secret_not_destroyed").
+   */
+  destroySecret(row: EntryMetadata): Promise<"deleted" | "overwritten">;
+}
+
+export function openEntryVault(deps: CardsDeps = {}): EntryVault {
+  const c = ctx(deps);
+  return {
+    entries: c.entries,
+    cards: c.cards,
+    nowMs: c.nowMs,
+    nowIso: c.nowIso,
+    ledger: (input, mustSucceed) => writeLedger(c, input, mustSucceed),
+    readSecret: (row) => loadEntrySecret(c, row),
+    writeSecret: (row, secret) => storeEntrySecret(c, row, secret),
+    destroySecret: async (row) => {
+      const service = backendService(requireEntryId(row.id));
+      let backend: VaultBackend;
+      try {
+        backend = await c.backend();
+      } catch {
+        throw new EntryError("vault_unavailable", "The vault could not be reached");
+      }
+      if (typeof backend.delete === "function") {
+        try {
+          // `ok: false` also covers "nothing was stored"; the locate below is what decides.
+          await backend.delete(service, BACKEND_USERNAME, BYPASS_REASON);
+        } catch {
+          throw new EntryError("vault_unavailable", "The vault could not be reached");
+        }
+        let still: unknown = null;
+        try {
+          still = await backend.locate(service, BACKEND_USERNAME, BYPASS_REASON);
+        } catch {
+          throw new EntryError("vault_unavailable", "The delete could not be verified");
+        }
+        if (still) throw new EntryError("purge_secret_not_destroyed", "The secret is still present after the delete");
+        return "deleted";
+      }
+      // No delete in this backend: destroy the value by overwriting it.
+      const filler = randomBytes(64).toString("base64url");
+      registerSecretForRedaction(filler);
+      let readBack: string;
+      try {
+        const put = await backend.put(
+          service,
+          BACKEND_USERNAME,
+          filler,
+          "echo-credential-broker vault v2 entry: PURGED (random filler, not a credential)",
+          BYPASS_REASON,
+        );
+        if (put && put.stored === false) throw new Error("not stored");
+        const got = await backend.get(service, BACKEND_USERNAME, BYPASS_REASON);
+        readBack = typeof got?.secret === "string" ? got.secret : "";
+        if (readBack) registerSecretForRedaction(readBack);
+      } catch {
+        throw new EntryError("vault_unavailable", "The vault could not be reached");
+      }
+      if (!constantTimeEqual(sha256Hex(readBack), sha256Hex(filler))) {
+        throw new EntryError("purge_secret_not_destroyed", "The overwrite could not be confirmed");
+      }
+      return "overwritten";
+    },
+  };
 }
 
 // ---------------------------------------------------------------- entries API
@@ -1008,6 +1302,90 @@ export async function flagForReentry(id: string, reason: string, deps: CardsDeps
   return publicEntry(row);
 }
 
+export interface RotationPolicyInput {
+  mode: RotationMode;
+  /** A number sets it, null clears it, undefined keeps the current value. */
+  interval_days?: number | null;
+  /** A string sets it, null clears it, undefined keeps the current value. Non-secret id only. */
+  provider_token_id?: string | null;
+}
+
+/**
+ * Set an entry's rotation policy. `rotate_by` is recomputed as (last rotation,
+ * or creation when it was never rotated) + interval; no interval → never due.
+ * mode "auto" needs an interval. `provider_token_id` is a NON-SECRET provider
+ * id: anything secret-shaped, or equal to the entry's own secret, is refused.
+ */
+export async function setRotationPolicy(
+  id: string,
+  policy: RotationPolicyInput,
+  deps: CardsDeps = {},
+): Promise<EntryMetadata> {
+  const c = ctx(deps);
+  const current = await c.entries.get(requireEntryId(id));
+  if (!current || current.status === "deleted") throw new EntryError("entry_not_found", "No such entry");
+  if (policy?.mode !== "manual" && policy?.mode !== "auto") {
+    throw invalid("rotation_mode", "mode must be manual or auto");
+  }
+  let interval = current.rotate_interval_days;
+  if (policy.interval_days !== undefined) {
+    const n = policy.interval_days;
+    if (n !== null && !(Number.isInteger(n) && n >= 1 && n <= MAX_ROTATE_INTERVAL_DAYS)) {
+      throw invalid("interval_days", `interval_days must be a whole number from 1 to ${MAX_ROTATE_INTERVAL_DAYS}`);
+    }
+    interval = n;
+  }
+  if (policy.mode === "auto" && interval === null) {
+    throw invalid("interval_days", "auto rotation needs interval_days");
+  }
+  let tokenId = current.provider_token_id;
+  if (policy.provider_token_id !== undefined) {
+    const t = policy.provider_token_id === null ? null : String(policy.provider_token_id).trim();
+    if (t !== null) {
+      if (!PROVIDER_TOKEN_ID_PATTERN.test(t)) {
+        throw invalid("provider_token_id", "provider_token_id must be 1-128 characters of A-Z a-z 0-9 . _ : -");
+      }
+      // The id is stored and shown as metadata: it must never be the credential itself.
+      if (looksLikeSecret(t) || secretFingerprint(t) === current.fingerprint) {
+        throw invalid("provider_token_id", "provider_token_id looks like a secret; give the provider's token ID, not its value");
+      }
+    }
+    tokenId = t;
+  }
+  const row = await c.entries.setRotation(
+    id,
+    {
+      rotation_mode: policy.mode,
+      rotate_interval_days: interval,
+      provider_token_id: tokenId,
+      rotate_by: rotateByFrom(current.last_rotated_at ?? current.created_at, interval),
+    },
+    c.nowIso,
+  );
+  if (!row) throw new EntryError("entry_not_found", "No such entry");
+  log.info("vault_entry_rotation_policy_set", {
+    entry_id: row.id,
+    site: row.site,
+    mode: row.rotation_mode,
+    interval_days: row.rotate_interval_days,
+  });
+  return publicEntry(row);
+}
+
+/** Active entries whose rotation is due at `now` (rotate_by <= now), oldest due first. Metadata only. */
+export async function listRotationDue(now: number | Date = Date.now(), deps: CardsDeps = {}): Promise<EntryMetadata[]> {
+  const ms = now instanceof Date ? now.getTime() : now;
+  if (!Number.isFinite(ms)) throw invalid("now", "now must be a valid time");
+  return (await ctx(deps).entries.listRotationDue(new Date(ms).toISOString())).map(publicEntry);
+}
+
+/** Record a failed rotation attempt as a SHORT CODE (anything else becomes "rotation_failed"). */
+export async function recordRotationError(id: string, code: string, deps: CardsDeps = {}): Promise<void> {
+  const c = ctx(deps);
+  const safe = ROTATION_ERROR_PATTERN.test(code) ? code : "rotation_failed";
+  await c.entries.setRotationError(requireEntryId(id), safe, c.nowIso);
+}
+
 export async function markUsed(id: string, deps: CardsDeps = {}): Promise<EntryMetadata> {
   const c = ctx(deps);
   const row = await c.entries.touchUsed(requireEntryId(id), c.nowIso);
@@ -1076,21 +1454,10 @@ export async function useEntry<T>(
 
   let secret: string;
   try {
-    const backend = await c.backend();
-    const coordinate = await backend.locate(backendService(row.id), BACKEND_USERNAME, BYPASS_REASON);
-    if (!coordinate) return await refuse("entry_secret_missing", "The vault has no secret for this entry", row);
-    const got = await backend.get(coordinate.service, coordinate.username, BYPASS_REASON);
-    if (typeof got?.secret !== "string" || got.secret.length === 0) {
-      return await refuse("entry_secret_missing", "The vault has no secret for this entry", row);
-    }
-    secret = got.secret;
+    secret = await loadEntrySecret(c, row);
   } catch (err) {
-    if (err instanceof EntryError) throw err;
-    return refuse("vault_unavailable", "The vault could not be reached", row);
-  }
-  registerSecretForRedaction(secret);
-  if (secretFingerprint(secret) !== row.fingerprint) {
-    log.warn("vault_entry_fingerprint_drift", { entry_id: row.id });
+    const e = err instanceof EntryError ? err : new EntryError("vault_unavailable", "The vault could not be reached");
+    return refuse(e.code, e.message, row);
   }
 
   let result: T;

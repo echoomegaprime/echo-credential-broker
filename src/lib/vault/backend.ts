@@ -23,6 +23,13 @@ export interface VaultBackend {
   locate(locateQuery: string, accountHint: string, bypassReason: string): Promise<{ service: string; username: string } | null>;
   /** Raw locate result (status + every candidate's service/username, never a secret) for discovery. */
   search(query: string, bypassReason: string): Promise<LocateResult>;
+  /**
+   * OPTIONAL real delete of one stored secret. `{ ok: true }` only when the
+   * value is gone. Implement it ONLY where the backend has a genuine delete
+   * call: the canonical gate vault has none (see store.ts), so GateVaultBackend
+   * deliberately omits it and v2 purge falls back to overwriting the value.
+   */
+  delete?(service: string, username: string, bypassReason: string): Promise<{ ok: boolean }>;
 }
 
 export class GateVaultBackend implements VaultBackend {
@@ -42,7 +49,7 @@ export class GateVaultBackend implements VaultBackend {
 
 /** In-memory backend for tests. Never touches the network or the real vault. */
 export class FakeVaultBackend implements VaultBackend {
-  private readonly secrets = new Map<string, string>(); // `${service}/${username}` -> secret
+  protected readonly secrets = new Map<string, string>(); // `${service}/${username}` -> secret
   private version = 0;
 
   async put(service: string, username: string, secret: string, _note: string, _bypassReason: string): Promise<PutResult> {
@@ -80,5 +87,12 @@ export class FakeVaultBackend implements VaultBackend {
       return { status: "EXACT" as const, service: query, candidates, get_with: { service: candidates[0].actual_service, username: candidates[0].username } };
     }
     return { status: "AMBIGUOUS" as const, service: query, count: candidates.length, candidates };
+  }
+}
+
+/** FakeVaultBackend plus a real delete, for exercising the `delete?` path of v2 purge in tests. */
+export class DeletableFakeVaultBackend extends FakeVaultBackend {
+  async delete(service: string, username: string, _bypassReason: string): Promise<{ ok: boolean }> {
+    return { ok: this.secrets.delete(`${service}/${username}`) };
   }
 }
