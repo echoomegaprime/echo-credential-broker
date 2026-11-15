@@ -17,7 +17,7 @@
  * This is a rehearsal stand-in. It is NOT the canonical vault and proves nothing
  * about it. Never point a production server at it.
  */
-import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -64,8 +64,60 @@ function readBody(req) {
  * Start the fake gate on 127.0.0.1.
  * @param {{ apiKey: string, port?: number }} opts `apiKey` is the value the server must send in X-Echo-API-Key.
  */
+/**
+ * The real gate's tier-2 rule (routers/sdk_invoke.py + routers/_auth_p4.py, read 2026-11-15):
+ * a capability of danger tier 2+ needs envelope.auth = { hmac, nonce, ts }, where
+ * hmac = HMAC-SHA256(bytes.fromhex(secret_hmac), "v1|api_key|capability|params_json|nonce|ts"),
+ * params_json is Python's json.dumps(sort_keys=True, separators=(",", ":")), ts is within
+ * 90 s and a nonce is single-use. Missing auth is 423, a bad one 401, both as {detail}.
+ * This stand-in used to accept unsigned writes; that is how the vault shipped without signing.
+ * Written here independently of src/lib/vault/gate-hmac.ts on purpose.
+ */
+const TIER2_PLUS = new Set(["echo.vault.put"]);
+const HMAC_TS_SKEW_S = 90;
+
+function pyJson(v) {
+  if (v === null) return "null";
+  if (typeof v === "string") {
+    return JSON.stringify(v).replace(/[\u0080-\uffff]/g, (c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"));
+  }
+  if (typeof v === "boolean") return v ? "true" : "false";
+  if (typeof v === "number") return String(v);
+  if (Array.isArray(v)) return "[" + v.map(pyJson).join(",") + "]";
+  const keys = Object.keys(v).sort((a, b) => {
+    const x = [...a];
+    const y = [...b];
+    for (let i = 0; i < Math.min(x.length, y.length); i++) {
+      const d = x[i].codePointAt(0) - y[i].codePointAt(0);
+      if (d) return d;
+    }
+    return x.length - y.length;
+  });
+  return "{" + keys.map((k) => pyJson(k) + ":" + pyJson(v[k])).join(",") + "}";
+}
+
+/** null when the envelope is correctly signed, else { code, detail } as the real gate answers. */
+function checkTier2Auth(opts, seenNonces, apiKey, capability, params, auth) {
+  if (!auth || typeof auth.hmac !== "string" || !auth.hmac) {
+    return { code: 423, detail: { error: "hmac_required_for_tier2_plus", capability } };
+  }
+  const refuse = (reason) => ({ code: 401, detail: { error: "hmac_verification_failed", reason, capability } });
+  if (typeof auth.nonce !== "string" || !auth.nonce || !Number.isInteger(auth.ts)) return refuse("hmac_fields_missing");
+  if (Math.abs(Math.floor(Date.now() / 1000) - auth.ts) > HMAC_TS_SKEW_S) return refuse("hmac_ts_out_of_window");
+  const msg = `v1|${apiKey}|${capability}|${pyJson(params)}|${auth.nonce}|${auth.ts}`;
+  const expected = createHmac("sha256", Buffer.from(opts.hmacSecret, "hex")).update(msg, "utf8").digest("hex");
+  if (!sameKey(expected, auth.hmac)) return refuse("hmac_signature_mismatch");
+  if (seenNonces.has(auth.nonce)) return refuse("nonce_replay_detected");
+  seenNonces.add(auth.nonce);
+  return null;
+}
+
 export async function startFakeGate(opts) {
   if (!opts || typeof opts.apiKey !== "string" || opts.apiKey.length < 8) throw new Error("fake gate: apiKey is required");
+  if (typeof opts.hmacSecret !== "string" || !/^(?:[0-9a-f]{2}){16,}$/i.test(opts.hmacSecret)) {
+    throw new Error("fake gate: hmacSecret (hex, 16+ bytes) is required — the real gate refuses unsigned tier-2 calls");
+  }
+  const seenNonces = new Set();
   /** `${service}\u0000${username}` → { secret, version, updated_at } */
   const store = new Map();
   /** Sanitized traffic: never holds a secret value. */
@@ -158,6 +210,14 @@ export async function startFakeGate(opts) {
       }
       const capability = typeof parsed?.capability === "string" ? parsed.capability : "";
       const params = parsed?.params && typeof parsed.params === "object" ? parsed.params : {};
+      if (TIER2_PLUS.has(capability)) {
+        const refused = checkTier2Auth(opts, seenNonces, presented, capability, params, parsed?.auth);
+        if (refused) {
+          traffic.push({ at: new Date().toISOString(), capability, rejected: refused.detail.error, reason: refused.detail.reason });
+          send(refused.code, { detail: refused.detail });
+          return;
+        }
+      }
       const out = invoke(capability, params);
       traffic.push({
         at: new Date().toISOString(),
@@ -215,7 +275,12 @@ if (isMain()) {
     console.error("fake-gate: set ECHO_SDK_API_KEY to the key the server will present (any 8+ character throwaway value).");
     process.exit(2);
   }
-  const gate = await startFakeGate({ apiKey, port: Number(process.env.PORT || 0) });
+  const hmacSecret = process.env.ECHO_SDK_HMAC_SECRET;
+  if (!hmacSecret) {
+    console.error("fake-gate: set ECHO_SDK_HMAC_SECRET to the hex secret the server signs with (any 32+ hex characters).");
+    process.exit(2);
+  }
+  const gate = await startFakeGate({ apiKey, hmacSecret, port: Number(process.env.PORT || 0) });
   console.log(`fake gate listening on ${gate.url} (in memory; point ECHO_SDK_GATE_URL at it)`);
   for (const signal of ["SIGINT", "SIGTERM"]) process.on(signal, () => gate.close().then(() => process.exit(0)));
 }

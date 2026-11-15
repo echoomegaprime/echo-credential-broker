@@ -1,0 +1,60 @@
+{
+ "secret": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+ "api_key": "ek_test_key_0123456789",
+ "capability": "echo.vault.put",
+ "nonce": "nonce0123456789ab",
+ "ts": 1794700000,
+ "cases": [
+  {
+   "name": "plain",
+   "params": {
+    "service": "echo_vault_entry_ve_1",
+    "username": "entry",
+    "secret": "tok-ABC-123",
+    "note": "n"
+   },
+   "json": "{\"note\":\"n\",\"secret\":\"tok-ABC-123\",\"service\":\"echo_vault_entry_ve_1\",\"username\":\"entry\"}",
+   "hmac": "c5c7a1f6704fa19f4623d56a02a675029971ff512fa286a07348f7f058c52afa"
+  },
+  {
+   "name": "unicode",
+   "params": {
+    "service": "s",
+    "username": "entry",
+    "secret": "p\u00e4$$\"w\\ord\n\t\u0001\u00e9\ud83d\ude00\u7f51",
+    "note": "echo-credential-broker vault v2 entry: httpbin.org \u2014 proof \u2014 e2e"
+   },
+   "json": "{\"note\":\"echo-credential-broker vault v2 entry: httpbin.org \\u2014 proof \\u2014 e2e\",\"secret\":\"p\\u00e4$$\\\"w\\\\ord\\n\\t\\u0001\\u00e9\\ud83d\\ude00\\u7f51\",\"service\":\"s\",\"username\":\"entry\"}",
+   "hmac": "cd499091ae087067817f282fd2c1e434f033c433869f2dbd2f22480f91bf35aa"
+  },
+  {
+   "name": "nested",
+   "params": {
+    "b": [
+     1,
+     true,
+     null,
+     {
+      "z": 0,
+      "a": "x"
+     }
+    ],
+    "a": {
+     "\ud83d\ude00": 1,
+     "\uffff": 2,
+     "k": -5
+    },
+    "Z": "",
+    "_": false
+   },
+   "json": "{\"Z\":\"\",\"_\":false,\"a\":{\"k\":-5,\"\\uffff\":2,\"\\ud83d\\ude00\":1},\"b\":[1,true,null,{\"a\":\"x\",\"z\":0}]}",
+   "hmac": "5575e85f6c158e81d079dcbdd0261414270ece492eb21f5adcf849d3c42599f8"
+  },
+  {
+   "name": "empty",
+   "params": {},
+   "json": "{}",
+   "hmac": "62f4296ea53bd3af386aed981b0141635c717ab7ba8f2eb3499d3349150485bd"
+  }
+ ]
+}

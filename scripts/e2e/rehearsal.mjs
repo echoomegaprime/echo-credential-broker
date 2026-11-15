@@ -93,6 +93,7 @@ function check(name, ok, detail = "") {
 const secrets = {
   credential: `rh/${b64url(24)}+${b64url(6)}`,
   gateApiKey: `fakegate_${b64url(24)}`,
+  gateHmacSecret: randomBytes(32).toString("hex"),
   botToken: `${randomInt(10_000_000, 99_999_999)}:AA${b64url(26).slice(0, 33)}`,
   approvalHmacKey: b64url(36),
   webhookSecret: b64url(24),
@@ -357,7 +358,7 @@ async function main() {
   out("");
 
   // -- fakes
-  const gate = await startFakeGate({ apiKey: secrets.gateApiKey });
+  const gate = await startFakeGate({ apiKey: secrets.gateApiKey, hmacSecret: secrets.gateHmacSecret });
   cleanups.push(() => gate.close());
   const telegram = await startFakeTelegram({ botToken: secrets.botToken });
   cleanups.push(() => telegram.close());
@@ -375,6 +376,7 @@ async function main() {
     ECHO_VAULT_APPROVAL_HMAC_KEY: secrets.approvalHmacKey,
     ECHO_VAULT_TELEGRAM_WEBHOOK_SECRET: secrets.webhookSecret,
     ECHO_SDK_API_KEY: secrets.gateApiKey,
+    ECHO_SDK_HMAC_SECRET: secrets.gateHmacSecret,
     ECHO_SDK_GATE_URL: gate.url,
     ECHO_VAULT_LEDGER_HMAC_KEY: secrets.ledgerHmacKey,
     ECHO_VAULT_ANCHOR_KEY: secrets.anchorKey,
