@@ -42,6 +42,7 @@ Work top to bottom. Nothing here needs a secret pasted into a chat.
 - [ ] `ECHO_VAULT_ANCHOR_KEY` (32+ characters) so ledger anchors are signed. Keep it out of the database.
 - [ ] Leave `ECHO_VAULT_CONSOLE` (the legacy read-only page) unset on a public host.
 - [ ] Owner console: `ECHO_VAULT_CONSOLE_ORIGIN` = the exact https origin the owner will open (for example `https://credbroker.echo-op.com`). Its hostname becomes the passkey RP ID, so choose it once. Leave it unset to keep `/console` off (503). Never set `ECHO_VAULT_CONSOLE_ALLOW_LOCALHOST` on a deployed server.
+- [ ] Optional (second decider): `ECHO_VAULT_BRIDGE_DECIDER_TOKEN` (32+ characters) lets Lyra's consent bridge decide connection + first-use approvals under its own ledger identity (`service:lyra-consent-bridge`). Leave unset to keep it off. Hand the same value to the bridge config on FORGE; keep `/api/internal/*` out of the public tunnel's ingress. See [ops/bridge-decider.md](./ops/bridge-decider.md).
 - [ ] Optional: `ECHO_VAULT_DIGEST_DENIAL_BURST` (default 10).
 - [ ] Optional: `ECHO_VAULT_POLICY_FILE`, `ECHO_VAULT_WORKLOAD_TOKENS_FILE`, the `ECHO_VAULT_GITHUB_*` variables. See `.env.example`.
 - [ ] Optional consent-grant tuning: `ECHO_VAULT_GRANT_TTL_MS` (grant lifetime, default `86400000` = 24 h) and `ECHO_VAULT_GRANT_MAX_USES` (un-prompted reads per grant, default `500`; `unlimited` for no cap).
