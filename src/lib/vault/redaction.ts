@@ -19,12 +19,24 @@ const PLACEHOLDERS = {
 } as const;
 
 const PATTERN_RULES: Array<{ re: RegExp; replacement: string }> = [
-  { re: /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, replacement: PLACEHOLDERS.github },
-  { re: /\bgh[pousr]_[A-Za-z0-9]{20,}\b/g, replacement: PLACEHOLDERS.github },
-  { re: /\bsk-live-[A-Za-z0-9]{16,}\b/g, replacement: PLACEHOLDERS.stripe },
-  { re: /\bsk-test-[A-Za-z0-9]{16,}\b/g, replacement: PLACEHOLDERS.stripe },
-  { re: /\bsk-[A-Za-z0-9]{20,}\b/g, replacement: PLACEHOLDERS.openai },
-  { re: /\bxai-[A-Za-z0-9_-]{20,}\b/g, replacement: PLACEHOLDERS.xai },
+  {
+    re: /-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----/g,
+    replacement: PLACEHOLDERS.privateKey,
+  },
+  {
+    re: /-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----[\s\S]*$/g,
+    replacement: PLACEHOLDERS.privateKey,
+  },
+  // GitHub installation tokens in the newer ghs_<APPID>_<JWT> form.
+  { re: /(?<![A-Za-z0-9])ghs_[0-9]+_[A-Za-z0-9._-]{20,}/g, replacement: PLACEHOLDERS.github },
+  // Vault-issued tokens: OAuth access/refresh/code/pending and workload tokens.
+  { re: /(?<![A-Za-z0-9])(?:ev[acpr]|ewk)_[A-Za-z0-9_-]{43,}/g, replacement: "[REDACTED_VAULT_TOKEN]" },
+  { re: /(?<![A-Za-z0-9])github_pat_[A-Za-z0-9_]{20,}\b/g, replacement: PLACEHOLDERS.github },
+  { re: /(?<![A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{20,}\b/g, replacement: PLACEHOLDERS.github },
+  { re: /(?<![A-Za-z0-9])sk-live-[A-Za-z0-9]{16,}\b/g, replacement: PLACEHOLDERS.stripe },
+  { re: /(?<![A-Za-z0-9])sk-test-[A-Za-z0-9]{16,}\b/g, replacement: PLACEHOLDERS.stripe },
+  { re: /(?<![A-Za-z0-9])sk-[A-Za-z0-9]{20,}\b/g, replacement: PLACEHOLDERS.openai },
+  { re: /(?<![A-Za-z0-9])xai-[A-Za-z0-9_-]{20,}\b/g, replacement: PLACEHOLDERS.xai },
   { re: /\bBearer\s+[A-Za-z0-9\-._~+/]+=*/gi, replacement: PLACEHOLDERS.bearer },
   {
     re: /\bAuthorization\s*:\s*[^\r\n]+/gi,
@@ -32,11 +44,7 @@ const PATTERN_RULES: Array<{ re: RegExp; replacement: string }> = [
   },
   { re: /\bx-access-token\s*[:=]\s*\S+/gi, replacement: "[REDACTED_ACCESS_TOKEN]" },
   {
-    re: /-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----/g,
-    replacement: PLACEHOLDERS.privateKey,
-  },
-  {
-    re: /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g,
+    re: /(?<![A-Za-z0-9])eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g,
     replacement: PLACEHOLDERS.jwt,
   },
   {
@@ -90,28 +98,32 @@ export function redactString(input: string): string {
   return out;
 }
 
+/**
+ * Redact a JSON-serializable value: sensitive keys are blanked and every
+ * string (keys included) passes through redactString. Works leaf by leaf, so a
+ * greedy rule such as `Authorization: …` can only consume the string it is in,
+ * never the JSON around it. Anything that is not plain JSON data fails closed.
+ */
 export function redactValue<T>(value: T): T {
   if (value == null) return value;
   if (typeof value === "string") return redactString(value) as T;
   if (typeof value !== "object") return value;
   try {
-    const stripped = stripSensitiveKeys(value);
-    return JSON.parse(redactString(JSON.stringify(stripped))) as T;
+    // Round-trip first: drops functions/undefined, resolves toJSON, rejects cycles and BigInt.
+    return redactTree(JSON.parse(JSON.stringify(value))) as T;
   } catch {
     return { error: "unserializable_redacted" } as T;
   }
 }
 
-function stripSensitiveKeys(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(stripSensitiveKeys);
+function redactTree(value: unknown): unknown {
+  if (typeof value === "string") return redactString(value);
+  if (Array.isArray(value)) return value.map(redactTree);
   if (value && typeof value === "object") {
     const out: Record<string, unknown> = {};
     for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
-      if (SENSITIVE_RESPONSE_KEYS.has(key.toLowerCase())) {
-        out[key] = PLACEHOLDERS.generic;
-      } else {
-        out[key] = stripSensitiveKeys(val);
-      }
+      const safeKey = redactString(key);
+      out[safeKey] = SENSITIVE_RESPONSE_KEYS.has(key.toLowerCase()) ? PLACEHOLDERS.generic : redactTree(val);
     }
     return out;
   }
@@ -130,7 +142,19 @@ export function sanitizeError(error: unknown): Error {
 
 export function safeJson(value: unknown): string {
   try {
-    return redactString(JSON.stringify(redactValue(value)));
+    const leafRedacted = JSON.stringify(redactValue(value));
+    if (leafRedacted === undefined) return "null";
+    // Second pass over the serialized text (catches a secret that only appears
+    // once escaped). It is used only if the text is still valid JSON; the
+    // leaf-redacted form is already safe.
+    const again = redactString(leafRedacted);
+    if (again === leafRedacted) return leafRedacted;
+    try {
+      JSON.parse(again);
+      return again;
+    } catch {
+      return leafRedacted;
+    }
   } catch {
     return '{"error":"unserializable_redacted"}';
   }

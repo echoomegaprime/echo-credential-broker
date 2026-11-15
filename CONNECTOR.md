@@ -4,11 +4,12 @@ Invariant: **Agents may USE credentials. Agents may NEVER READ credentials.**
 
 ```
 You → Grok / GPT / Claude
-        → Echo Vault MCP  (/api/mcp or stdio)
-        → vault://github/echoomegaprime  (opaque handle)
-        → allowlisted provider (api.github.com, …)
+        → OAuth access token (you approve the client on Telegram)
+        → Echo Vault MCP  (/api/mcp, or stdio for a local client)
+        → policy → approval if needed → action with the credential injected
+        → site or provider API
 ```
 
-There is no `get_secret`. Callers send `x-echo-agent: grok|chatgpt|claude`.
+There is no `get_secret`, and no caller header: a client is who its token says it is.
 
 Full steps: [docs/INSTALL.md](./docs/INSTALL.md)

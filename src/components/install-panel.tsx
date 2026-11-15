@@ -70,7 +70,6 @@ export function InstallPanel() {
         "echo-credential-broker": {
           type: "http",
           url: `${origin}/api/mcp`,
-          headers: { "x-echo-agent": "grok" },
         },
       },
     },
@@ -80,7 +79,7 @@ export function InstallPanel() {
 
   const gptAction = `Import OpenAPI: ${origin}/install/chatgpt.openapi.json
 Server: ${origin}
-Header: x-echo-agent = chatgpt
+Auth: OAuth 2.1 (the client registers itself; you approve it on Telegram)
 MCP URL: ${origin}/api/mcp`;
 
   const claudeDesktop = JSON.stringify(
@@ -90,7 +89,7 @@ MCP URL: ${origin}/api/mcp`;
           command: "node",
           args: ["--experimental-strip-types", "scripts/mcp-stdio.ts"],
           cwd: "/ABSOLUTE/PATH/TO/echo-credential-broker",
-          env: { ECHO_AGENT: "claude" },
+          env: { ECHO_AGENT: "claude-desktop" },
         },
       },
     },
@@ -143,7 +142,7 @@ npm run mcp`;
               Install GitHub app
               <ExternalLink className="size-3.5" />
             </a>
-            <p className="font-mono text-[11px] text-subtle">x-echo-agent: {app.caller}</p>
+            <p className="font-mono text-[11px] text-subtle">Connects with OAuth — approved on your phone</p>
           </Card>
         ))}
       </div>
@@ -152,7 +151,7 @@ npm run mcp`;
         <CardHeader>
           <CardTitle>Grok MCP</CardTitle>
           <CardDescription>
-            Settings → Connectors → add MCP. Header is required.
+            Settings → Connectors → add MCP. The client signs in with OAuth; approve it on Telegram.
           </CardDescription>
         </CardHeader>
         <CopyBlock label="HTTP connector" value={grokHttp} />
@@ -180,7 +179,7 @@ npm run mcp`;
         <div className="mt-3">
           <CopyBlock
             label="Claude Code"
-            value="claude mcp add echo-credential-broker --env ECHO_AGENT=claude -- node --experimental-strip-types scripts/mcp-stdio.ts"
+            value="claude mcp add echo-credential-broker --env ECHO_AGENT=claude-code -- node --experimental-strip-types scripts/mcp-stdio.ts"
           />
         </div>
       </Card>

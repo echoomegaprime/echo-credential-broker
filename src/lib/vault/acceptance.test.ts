@@ -10,13 +10,32 @@ import {
 } from "./redaction.ts";
 import { CredentialStore } from "./store.ts";
 import { FakeVaultBackend } from "./backend.ts";
-import { callTool, vaultList } from "./tools.ts";
+import { vaultList } from "./tools.ts";
 import { useCredential } from "./broker.ts";
 import { assertSafeDestination } from "./policy.ts";
 import { handleMcpRequest } from "./mcp.ts";
 import { ensureImported } from "./importer.ts";
 import { getStore } from "./store.ts";
 import { FORBIDDEN_TOOLS } from "./types.ts";
+import type { ClientIdentity } from "./v2/contracts.ts";
+import { dispatchTool, type GatewayDeps } from "./v2/gateway.ts";
+import { Ledger, MemoryLedgerStore } from "./v2/ledger.ts";
+
+/** An authenticated client as a transport would hand it to the gateway (read scopes only). */
+const CLIENT: ClientIdentity = {
+  client_id: "local:acceptance-test",
+  name: "acceptance-test",
+  kind: "local",
+  scopes: ["github.read", "vault.read"],
+};
+
+/**
+ * The "live" block talks to the real vault gate and to GitHub. It only runs
+ * when explicitly requested AND the gate credential is present; otherwise it
+ * is reported as skipped, not failed. (It used to run unconditionally, so the
+ * whole file failed on any machine without production credentials.)
+ */
+const LIVE = process.env.ECHO_VAULT_LIVE_TESTS === "1" && Boolean(process.env.ECHO_SDK_API_KEY);
 
 const FAKE_PAT = "github_pat_TESTONLY_LEAKPROBE_ABCDEF0123456789ZZZZ";
 const FAKE_GHP = "ghp_TESTONLYLEAKPROBE0000000000000000";
@@ -25,7 +44,10 @@ const GITHUB_REF = "vault://github/echoomegaprime";
 const captured: string[] = [];
 
 function installCapture(): void {
-  installProcessRedaction();
+  // Under `node --test` the child's stdout carries the runner's binary event
+  // stream; rewriting those bytes as text corrupts it. Redact process output
+  // only when this file runs on its own. The capture below records either way.
+  if (!process.env.NODE_TEST_CONTEXT) installProcessRedaction();
   const wrap = (stream: NodeJS.WriteStream) => {
     const orig = stream.write.bind(stream);
     stream.write = ((chunk: unknown, enc?: unknown, cb?: unknown) => {
@@ -57,6 +79,8 @@ describe("echo credential broker acceptance", () => {
   // writing FAKE_PAT under vault://github/echoomegaprime with the real
   // GateVaultBackend would overwrite the production GitHub credential.
   const store = new CredentialStore(new FakeVaultBackend());
+  const ledger = new Ledger({ store: new MemoryLedgerStore() });
+  const deps: GatewayDeps = { store, ledger: (input) => ledger.append(input) };
 
   before(async () => {
     installCapture();
@@ -104,7 +128,8 @@ describe("echo credential broker acceptance", () => {
         method: "tools/call",
         params: { name: "vault_list", arguments: {} },
       },
-      "acceptance-test",
+      CLIENT,
+      deps,
     );
     const serialized = safeJson(mcp);
     assertNoTokenLeak("mcp vault_list", serialized);
@@ -147,11 +172,7 @@ describe("echo credential broker acceptance", () => {
   });
 
   it("9. a fake vault reference fails closed", async () => {
-    const result = await callTool(
-      "credential_health",
-      { credential_ref: "vault://github/does-not-exist" },
-      { caller: "acceptance-test", store },
-    );
+    const result = await dispatchTool(CLIENT, "credential_health", { credential_ref: "vault://github/does-not-exist" }, deps);
     assert.equal(result.ok, false);
     if (!result.ok) {
       assert.equal(result.error, "credential_unavailable");
@@ -161,9 +182,19 @@ describe("echo credential broker acceptance", () => {
 
   it("rejects get_secret and every other forbidden tool", async () => {
     for (const name of FORBIDDEN_TOOLS) {
-      const result = await callTool(name, {}, { caller: "acceptance-test", store });
+      const result = await dispatchTool(CLIENT, name, {}, deps);
       assert.equal(result.ok, false);
       if (!result.ok) assert.equal(result.error, "tool_forbidden");
+    }
+    const denied = await ledger.list({ capability: "vault.secret.reveal" });
+    assert.equal(denied.length, FORBIDDEN_TOOLS.length);
+    assert.ok(denied.every((row) => row.result === "denied" && row.tier === 3));
+  });
+
+  it("a caller without an authenticated identity gets nothing", async () => {
+    for (const bogus of [null, undefined, "claude", { client_id: "claude" }, { client_id: "", kind: "oauth", scopes: [] }]) {
+      const result = await dispatchTool(bogus as never, "vault_list", {}, deps);
+      assert.deepEqual(result, { ok: false, error: "unauthenticated" });
     }
   });
 
@@ -174,7 +205,11 @@ describe("echo credential broker acceptance", () => {
   });
 });
 
-describe("live GitHub credential (sandbox import)", () => {
+describe("live GitHub credential (sandbox import)", { skip: LIVE ? false : "set ECHO_VAULT_LIVE_TESTS=1 and ECHO_SDK_API_KEY to run against the real vault" }, () => {
+  const LIVE_CLIENT: ClientIdentity = { ...CLIENT, scopes: ["github.read", "vault.read"] };
+  const liveLedger = new Ledger({ store: new MemoryLedgerStore() });
+  const liveDeps: GatewayDeps = { ledger: (input) => liveLedger.append(input) };
+
   it("2-4. health, public lookup, and private repo via real vault credential", async () => {
     await ensureImported();
     const store = getStore();
@@ -183,11 +218,7 @@ describe("live GitHub credential (sandbox import)", () => {
       assert.fail("sandbox GitHub credential was not imported");
     }
 
-    const health = await callTool(
-      "credential_health",
-      { credential_ref: GITHUB_REF },
-      { caller: "acceptance-test" },
-    );
+    const health = await dispatchTool(LIVE_CLIENT, "credential_health", { credential_ref: GITHUB_REF }, liveDeps);
     assert.equal(health.ok, true, safeJson(health));
     if (!health.ok) return;
     const h = health.data as {
@@ -202,10 +233,11 @@ describe("live GitHub credential (sandbox import)", () => {
     assert.equal(h.status, "healthy");
     assertNoTokenLeak("health", safeJson(health));
 
-    const repo = await callTool(
+    const repo = await dispatchTool(
+      LIVE_CLIENT,
       "github_get_repository",
       { owner: "echoomegaprime", repo: "echo-continuity-fabric" },
-      { caller: "acceptance-test" },
+      liveDeps,
     );
     assert.equal(repo.ok, true, safeJson(repo));
     if (!repo.ok) return;
@@ -219,6 +251,9 @@ describe("live GitHub credential (sandbox import)", () => {
     assertNoTokenLeak("repo", safeJson(repo));
   });
 
+});
+
+describe("process output", () => {
   it("10. scan of this process output finds no GitHub token prefixes", () => {
     const blob = captured.join("\n");
     assertNoTokenLeak("final process scan", blob);

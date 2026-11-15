@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Echo Credential Broker",
-    "version": "1.0.0",
-    "description": "MCP JSON-RPC for Echo Vault. Agents may USE credentials via vault:// references. Agents may NEVER READ credentials. There is no get_secret tool."
+    "version": "2.0.0",
+    "description": "MCP JSON-RPC for Echo Vault. Agents may USE credentials. Agents may NEVER READ credentials. There is no tool that returns a secret. Authentication is an OAuth 2.1 access token (Authorization: Bearer); no self-asserted header is accepted."
   },
   "servers": [
     {
@@ -15,30 +15,25 @@
     "/api/mcp": {
       "get": {
         "operationId": "listBroker",
-        "summary": "List tools and invariant (never returns secrets)",
-        "parameters": [
-          {
-            "name": "x-echo-agent",
-            "in": "header",
-            "required": true,
-            "schema": { "type": "string", "enum": ["chatgpt", "grok", "claude"] }
-          }
-        ],
+        "summary": "Server name and invariant; the tool list only when authenticated",
         "responses": {
-          "200": { "description": "Tool catalog" }
-        }
+          "200": {
+            "description": "Tool catalog"
+          },
+          "401": {
+            "description": "Missing or invalid access token. WWW-Authenticate names the protected-resource metadata."
+          }
+        },
+        "security": [
+          {
+            "vaultOAuth": []
+          },
+          {}
+        ]
       },
       "post": {
         "operationId": "mcpCall",
         "summary": "JSON-RPC initialize, tools/list, tools/call",
-        "parameters": [
-          {
-            "name": "x-echo-agent",
-            "in": "header",
-            "required": true,
-            "schema": { "type": "string", "default": "chatgpt" }
-          }
-        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -46,21 +41,73 @@
               "schema": {
                 "type": "object",
                 "properties": {
-                  "jsonrpc": { "type": "string", "enum": ["2.0"] },
+                  "jsonrpc": {
+                    "type": "string",
+                    "enum": [
+                      "2.0"
+                    ]
+                  },
                   "id": {},
                   "method": {
                     "type": "string",
-                    "enum": ["initialize", "tools/list", "tools/call"]
+                    "enum": [
+                      "initialize",
+                      "tools/list",
+                      "tools/call"
+                    ]
                   },
-                  "params": { "type": "object" }
+                  "params": {
+                    "type": "object"
+                  }
                 },
-                "required": ["jsonrpc", "method"]
+                "required": [
+                  "jsonrpc",
+                  "method"
+                ]
               }
             }
           }
         },
         "responses": {
-          "200": { "description": "JSON-RPC result (redacted)" }
+          "200": {
+            "description": "JSON-RPC result (redacted)"
+          },
+          "401": {
+            "description": "Missing or invalid access token. WWW-Authenticate names the protected-resource metadata."
+          }
+        },
+        "security": [
+          {
+            "vaultOAuth": []
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "vaultOAuth": {
+        "type": "oauth2",
+        "description": "Dynamic client registration at /api/oauth/register; the owner approves each new client on Telegram.",
+        "flows": {
+          "authorizationCode": {
+            "authorizationUrl": "https://credbroker.echo-op.com/api/oauth/authorize",
+            "tokenUrl": "https://credbroker.echo-op.com/api/oauth/token",
+            "scopes": {
+              "github.read": "github.read",
+              "github.write": "github.write",
+              "cloudflare.read": "cloudflare.read",
+              "cloudflare.write": "cloudflare.write",
+              "openai.read": "openai.read",
+              "openai.write": "openai.write",
+              "stripe.read": "stripe.read",
+              "xai.read": "xai.read",
+              "xai.write": "xai.write",
+              "vault.read": "vault.read",
+              "vault.write": "vault.write",
+              "audit.read": "audit.read"
+            }
+          }
         }
       }
     }

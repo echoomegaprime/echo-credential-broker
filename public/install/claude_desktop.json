@@ -8,7 +8,7 @@
       ],
       "cwd": "/ABSOLUTE/PATH/TO/echo-credential-broker",
       "env": {
-        "ECHO_AGENT": "claude"
+        "ECHO_AGENT": "claude-desktop"
       }
     }
   }

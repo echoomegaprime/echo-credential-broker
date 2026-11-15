@@ -42,6 +42,15 @@ export default tseslint.config(
       "@typescript-eslint/no-explicit-any": "off",
     },
   },
+  {
+    // Server-only vault code and Node scripts: nothing here is a React
+    // component, and `useCredential` / `useEntry` are not hooks.
+    files: ["src/lib/vault/**/*.ts", "scripts/**/*.{ts,mjs}"],
+    rules: {
+      "react-hooks/rules-of-hooks": "off",
+      "react-hooks/exhaustive-deps": "off",
+    },
+  },
   // Disable rules that conflict with Prettier formatting.
   prettier,
 );

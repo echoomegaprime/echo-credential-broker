@@ -97,87 +97,94 @@ function parseArgs(raw: unknown): ToolArgs {
   return {};
 }
 
+/**
+ * Owner console RPCs. These are plain server functions: anyone who can reach
+ * the web port can call them, and there is no login in front of them. So:
+ *
+ *   - They are OFF unless `ECHO_VAULT_CONSOLE=local` is set. Set it only when
+ *     the port is reachable by the owner alone (localhost / a private LAN),
+ *     never on the public deployment.
+ *   - When on, every call goes through the same gateway as any agent
+ *     (dispatchTool) as the fixed identity `local:vault-console`, which holds
+ *     READ scopes only. Writes, approvals-required actions and tier-3 actions
+ *     get the same answers an under-scoped agent would get.
+ *   - There is no reveal. Reading a secret value is tier 3 ("never through
+ *     this broker"): use the canonical vault directly.
+ */
+const CONSOLE_SCOPES = [
+  "github.read",
+  "cloudflare.read",
+  "openai.read",
+  "stripe.read",
+  "xai.read",
+  "vault.read",
+  "audit.read",
+];
+
+function consoleEnabled(): boolean {
+  return process.env.ECHO_VAULT_CONSOLE?.trim().toLowerCase() === "local";
+}
+
+async function consoleCall(name: string, args: Record<string, unknown>): Promise<RpcJson> {
+  if (!consoleEnabled()) {
+    return { ok: false, error: "console_disabled", detail: "Set ECHO_VAULT_CONSOLE=local on a private, owner-only host to enable the console." };
+  }
+  const { dispatchTool } = await import("./vault/v2/gateway.ts");
+  return asRpc(
+    await dispatchTool({ client_id: "local:vault-console", name: "Vault console", kind: "local", scopes: [...CONSOLE_SCOPES] }, name, args),
+  );
+}
+
 export const rpcVaultStatus = createServerFn({ method: "GET" }).handler(
-  async (): Promise<RpcJson> => {
-    const { callTool } = await import("./vault/tools.ts");
-    return asRpc(await callTool("vault_status", {}, { caller: "vault-console" }));
-  },
+  async (): Promise<RpcJson> => consoleCall("vault_status", {}),
 );
 
 export const rpcVaultList = createServerFn({ method: "GET" }).handler(
-  async (): Promise<RpcJson> => {
-    const { callTool } = await import("./vault/tools.ts");
-    return asRpc(await callTool("vault_list", {}, { caller: "vault-console" }));
-  },
+  async (): Promise<RpcJson> => consoleCall("vault_list", {}),
 );
 
-export const rpcAuditList = createServerFn({ method: "GET" }).handler(
-  async (): Promise<RpcJson> => {
-    const { callTool } = await import("./vault/tools.ts");
-    return asRpc(await callTool("audit_list", { limit: 50 }, { caller: "vault-console" }));
-  },
-);
+export const rpcAuditList = createServerFn({ method: "GET" }).handler(async (): Promise<RpcJson> => {
+  const res = await consoleCall("audit_list", { limit: 50 });
+  if (!res.ok) return res;
+  // Ledger rows → the record shape the console table renders.
+  const rows = ((res.data as { records?: Array<Record<string, unknown>> } | undefined)?.records ?? []).map((r) => ({
+    id: String(r.id ?? ""),
+    timestamp: String(r.timestamp ?? ""),
+    caller: String(r.client_id ?? ""),
+    credential_ref: typeof r.credential_ref === "string" ? r.credential_ref : "",
+    provider: String(r.capability ?? "").split(".")[0],
+    operation: String(r.capability ?? ""),
+    resource: String(r.resource ?? ""),
+    http_status: typeof r.http_status === "number" ? r.http_status : null,
+    duration_ms: typeof r.duration_ms === "number" ? r.duration_ms : 0,
+    result: String(r.result ?? ""),
+    error: typeof r.error === "string" ? r.error : undefined,
+  }));
+  return { ok: true, data: { records: rows } };
+});
 
-export const rpcListTools = createServerFn({ method: "GET" }).handler(
-  async (): Promise<RpcJson> => {
-    const { listTools } = await import("./vault/tools.ts");
-    return asRpc({
-      ok: true,
-      data: {
-        tools: listTools().map((t) => ({
-          name: t.name,
-          description: t.description,
-        })),
-      },
-    });
-  },
-);
+export const rpcListTools = createServerFn({ method: "GET" }).handler(async (): Promise<RpcJson> => {
+  if (!consoleEnabled()) return { ok: false, error: "console_disabled" };
+  const { listTools } = await import("./vault/v2/gateway.ts");
+  return asRpc({
+    ok: true,
+    data: { tools: listTools().map((t) => ({ name: t.name, description: t.description })) },
+  });
+});
 
 /**
- * HUMAN-ONLY secret reveal — deliberately NOT an MCP tool and NOT reachable
- * from `/api/mcp`. This is the one legitimate place a raw secret crosses the
- * server/client boundary: the Commander asking the console, in his own
- * browser, to show him a credential so he can copy/paste it somewhere. No
- * agent (Claude/GPT/Grok/Codex) has any tool that calls this — the MCP tool
- * surface (`vault/tools.ts`) still has zero `get_secret`-shaped tool and
- * never will. Every reveal is audited as a distinct `human_reveal` operation.
- *
- * Trust boundary today: same as every other console/MCP operation on this
- * broker — reachable to whoever can reach the FORGE LAN port. `provider_request`
- * / `credential_use` already let any caller on that boundary perform an
- * authenticated action with any vault credential, so a reveal is not a wider
- * blast radius than what already exists ungated. Real per-user login is a
- * natural hardening step if this ever needs a *tighter* boundary than that.
+ * Removed in v2. This used to return a raw secret to whoever could reach the
+ * web port. Nothing in this process returns a secret any more; the function
+ * stays so the console compiles and always answers `reveal_disabled`.
  */
 export const rpcRevealSecret = createServerFn({ method: "POST" })
   .validator((data: { credential_ref: string }) => ({
     credential_ref: String(data.credential_ref),
   }))
-  .handler(async ({ data }): Promise<{ ok: true; secret: string } | { ok: false; error: string }> => {
-    const { getStore } = await import("./vault/store.ts");
-    const { recordAudit } = await import("./vault/audit.ts");
-    const { parseVaultRef } = await import("./vault/refs.ts");
-    const started = Date.now();
-    const parsed = parseVaultRef(data.credential_ref);
-    if (!parsed) return { ok: false, error: "invalid_credential_ref" };
-    const store = getStore();
-    const secret = await store.resolveSecret(parsed.raw);
-    recordAudit({
-      caller: "vault-console:human",
-      credential_ref: parsed.raw,
-      provider: parsed.provider,
-      operation: "human_reveal",
-      resource: parsed.raw,
-      http_status: null,
-      duration_ms: Date.now() - started,
-      result: secret ? "ok" : "error",
-      error: secret ? undefined : "credential_unavailable",
-    });
-    if (!secret) return { ok: false, error: "credential_unavailable" };
-    // Deliberately bypassed: asRpc()/redactValue()/safeJson() elsewhere in this
-    // file exist to STRIP secrets from every other response. This is the one
-    // response that must carry the real value, so it must never pass through them.
-    return { ok: true, secret };
+  .handler(async (): Promise<{ ok: true; secret: string } | { ok: false; error: string }> => {
+    const { log } = await import("./vault/log.ts");
+    log.warn("console_reveal_refused", { reason: "tier3_human_only" });
+    return { ok: false, error: "reveal_disabled" };
   });
 
 export const rpcCallTool = createServerFn({ method: "POST" })
@@ -187,10 +194,9 @@ export const rpcCallTool = createServerFn({ method: "POST" })
     argsJson: data.argsJson ?? "",
   }))
   .handler(async ({ data }): Promise<RpcJson> => {
-    const { callTool } = await import("./vault/tools.ts");
     const args = {
       ...parseArgs(data.arguments),
       ...parseArgs(data.argsJson),
     };
-    return asRpc(await callTool(data.name, args, { caller: "vault-console" }));
+    return consoleCall(data.name, args);
   });
