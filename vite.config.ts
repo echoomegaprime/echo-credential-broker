@@ -170,11 +170,20 @@ export default defineConfig(({ command, isPreview }) => ({
     ...(command === "build" || isPreview
       ? [
           nitro({
-            preset: "vercel",
+            // "vercel" unless the host says otherwise. A self-hosted Node box sets
+            // NITRO_PRESET=node-server and starts .output/server/index.mjs
+            // (docs/ops/self-host.md).
+            preset: process.env.NITRO_PRESET?.trim() || "vercel",
             // Auto-registers server/middleware/* (the PWA install page +
             // manifest + head-tag middleware). Nitro v3 defaults serverDir to
             // false, so removing this silently unwires /?install=1 on deploys.
             serverDir: "./server",
+            // Keep the passkey library and its dependency chain out of the bundle, as real
+            // packages in the output's node_modules. Bundled, the chunk that holds
+            // @simplewebauthn/server statically imports tsyringe, which throws at load
+            // unless the Reflect polyfill ran first — and the bundler does not keep that
+            // order. As packages, owner-console.ts loads the polyfill, then the library.
+            traceDeps: ["reflect-metadata*", "@simplewebauthn/server*", "@peculiar/x509*", "tsyringe*"],
           }),
         ]
       : []),

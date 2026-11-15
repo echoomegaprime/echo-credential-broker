@@ -37,12 +37,6 @@
  * short codes only — never a token, challenge, code or credential public key.
  */
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import {
-  generateAuthenticationOptions,
-  generateRegistrationOptions,
-  verifyAuthenticationResponse,
-  verifyRegistrationResponse,
-} from "@simplewebauthn/server";
 import { log } from "../log.ts";
 import { sanitizeDisplayText } from "./approvals.ts";
 import type { ClientIdentity, LedgerEntryInput } from "./contracts.ts";
@@ -64,6 +58,19 @@ import {
   withRateLimitStore,
   type RateLimitStore,
 } from "./rate-limit-store.ts";
+
+type WebAuthn = typeof import("@simplewebauthn/server");
+let webauthnLib: Promise<WebAuthn> | undefined;
+/**
+ * @simplewebauthn/server pulls in tsyringe (via @peculiar/x509), which throws at module
+ * load unless the Reflect metadata polyfill is already installed. A bare
+ * `import "reflect-metadata"` is dropped by the production bundler, so every /console
+ * request failed in a built server while unbundled Node (the tests) worked. Loading both
+ * here, in order, at first use is the one form the bundler keeps.
+ */
+function webauthn(): Promise<WebAuthn> {
+  return (webauthnLib ??= import("reflect-metadata").then(() => import("@simplewebauthn/server")));
+}
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -309,7 +316,7 @@ function passkeyView(p: PasskeyRecord): PasskeyView {
 async function registrationOptions(c: Ctx, purpose: "enroll" | "add_passkey", sessionId: string | null): Promise<unknown> {
   const existing = await c.store.listPasskeys();
   if (existing.length >= MAX_PASSKEYS) throw new ConsoleError("too_many_passkeys");
-  const options = await generateRegistrationOptions({
+  const options = await (await webauthn()).generateRegistrationOptions({
     rpName: RP_NAME,
     rpID: c.cfg.rpId,
     userName: "owner",
@@ -343,8 +350,8 @@ async function verifyRegistration(
   if (!used.ok) return used;
   let info;
   try {
-    const verification = await verifyRegistrationResponse({
-      response: response as Parameters<typeof verifyRegistrationResponse>[0]["response"],
+    const verification = await (await webauthn()).verifyRegistrationResponse({
+      response: response as Parameters<WebAuthn["verifyRegistrationResponse"]>[0]["response"],
       expectedChallenge: used.challenge,
       expectedOrigin: c.cfg.origin,
       expectedRPID: c.cfg.rpId,
@@ -432,7 +439,7 @@ export async function finishEnroll(
 // ---------------------------------------------------------------------------
 
 async function assertionOptions(c: Ctx, purpose: "login" | "stepup", sessionId: string | null): Promise<unknown> {
-  const options = await generateAuthenticationOptions({
+  const options = await (await webauthn()).generateAuthenticationOptions({
     rpID: c.cfg.rpId,
     challenge: new Uint8Array(randomBytes(32)),
     timeout: CHALLENGE_TTL_MS,
@@ -474,8 +481,8 @@ async function verifyAssertion(
 
   const check = async (counter: number): Promise<number | null> => {
     try {
-      const verification = await verifyAuthenticationResponse({
-        response: response as Parameters<typeof verifyAuthenticationResponse>[0]["response"],
+      const verification = await (await webauthn()).verifyAuthenticationResponse({
+        response: response as Parameters<WebAuthn["verifyAuthenticationResponse"]>[0]["response"],
         expectedChallenge: used.challenge,
         expectedOrigin: c.cfg.origin,
         expectedRPID: c.cfg.rpId,
