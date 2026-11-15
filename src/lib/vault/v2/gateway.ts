@@ -59,6 +59,7 @@
  */
 import { createHash } from "node:crypto";
 import { lookup as dnsLookup } from "node:dns/promises";
+import { isIP } from "node:net";
 import { useCredential, type BrokerContext } from "../broker.ts";
 import { log } from "../log.ts";
 import { isBlockedHost, isPrivateOrLinkLocalIp, normalizeResourcePath, PROVIDER_POLICIES } from "../policy.ts";
@@ -114,6 +115,7 @@ import {
 } from "./github-capabilities.ts";
 import { appendLedger, ledgerHead, listLedger, verifyLedger, type LedgerVerifyResult } from "./ledger.ts";
 import { purgeEntry, rotateEntry, setEntryRotation, type RotationDeps } from "./rotation.ts";
+import { pinnedFetch, type PinnedFetch } from "./pinned-fetch.ts";
 import {
   evaluatePolicy,
   lookupCapability,
@@ -154,8 +156,14 @@ export interface GatewayDeps {
   /** Entries + cards wiring. */
   cards?: CardsDeps;
   grants?: EntryGrantStore;
-  /** Transport for entry_use site requests. Default: globalThis.fetch. */
+  /**
+   * TEST injection point for entry_use site requests. When absent (production)
+   * the request goes through `pinnedFetch`, connected only to the addresses
+   * that passed the checks; never through globalThis.fetch.
+   */
   fetch?: typeof fetch;
+  /** The DNS-pinned transport for entry_use. Default: pinnedFetch (node:https + pinned lookup). Tests may substitute it. */
+  pinnedFetch?: PinnedFetch;
   /** Host → IP addresses, for the private-address check before an entry_use request. Default: DNS. */
   resolveHost?: (host: string) => Promise<string[]>;
   now?: () => number;
@@ -868,7 +876,11 @@ async function siteRequest(
     throw new Error("dns_lookup_failed");
   }
   if (addresses.length === 0) throw new Error("dns_lookup_failed");
-  if (addresses.some((ip) => isBlockedHost(ip) || isPrivateOrLinkLocalIp(ip))) throw new Error("hostname_not_allowed");
+  // Resolved ONCE. Every answer must be a public IP literal (one private
+  // answer rejects the lot), and the connection below is pinned to exactly
+  // these addresses, so a second, different DNS answer cannot redirect it.
+  if (addresses.some((ip) => isIP(ip) === 0 || isBlockedHost(ip) || isPrivateOrLinkLocalIp(ip))) throw new Error("hostname_not_allowed");
+  const pinnedAddresses = [...new Set(addresses)];
 
   const headers = new Headers({
     "user-agent": "Echo-Credential-Broker/2.0",
@@ -894,7 +906,21 @@ async function siteRequest(
     headers.set("content-type", req.contentType ?? "text/plain");
     init.body = req.bodyText;
   }
-  const res = await (deps.fetch ?? globalThis.fetch)(url, init);
+  let res: Response;
+  if (deps.fetch) {
+    res = await deps.fetch(url, init); // tests only
+  } else {
+    res = await (deps.pinnedFetch ?? pinnedFetch)(
+      url,
+      { method: req.method, headers, body: req.bodyText, signal: init.signal },
+      {
+        addresses: pinnedAddresses,
+        timeoutMs: ENTRY_USE_LIMITS.timeoutMs,
+        maxResponseBytes: ENTRY_USE_LIMITS.maxResponseBytes,
+        onConnect: (address) => log.info("vault_entry_use_connected", { entry_id: entry.id, host: url.hostname, address }),
+      },
+    );
+  }
   const raw = await readLimited(res, ENTRY_USE_LIMITS.maxResponseBytes);
   const text = redactString(raw.toString("utf8"));
   const contentType = res.headers.get("content-type");
