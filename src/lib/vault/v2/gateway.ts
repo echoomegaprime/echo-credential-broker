@@ -93,6 +93,7 @@ import {
   flagForReentry,
   getCardStatus,
   listEntries,
+  listRotationDue,
   requestCard,
   resolveEntry,
   useEntry,
@@ -112,6 +113,7 @@ import {
   type GithubCapabilityResult,
 } from "./github-capabilities.ts";
 import { appendLedger, ledgerHead, listLedger, verifyLedger, type LedgerVerifyResult } from "./ledger.ts";
+import { purgeEntry, rotateEntry, setEntryRotation, type RotationDeps } from "./rotation.ts";
 import {
   evaluatePolicy,
   lookupCapability,
@@ -503,6 +505,38 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = Object.freeze([
       site: { type: "string", description: "Limit to one site." },
       query: { type: "string", description: "Case-insensitive substring of the entry label." },
     }),
+  },
+  {
+    name: "admin_set_rotation",
+    description:
+      "OWNER ONLY (local stdio): set an entry's rotation policy. mode manual = re-enter on a card; mode auto = the provider rotator rolls it (Cloudflare API tokens: provider_token_id is the 32-hex token ID, never the token). Metadata only. Any remote caller is refused (tier 3).",
+    inputSchema: schema(
+      {
+        entry_id: { type: "string" },
+        mode: { type: "string", enum: ["manual", "auto"] },
+        interval_days: { type: "integer", minimum: 1, maximum: 3650, description: "Rotate every N days. Omit to keep the current interval." },
+        provider_token_id: { type: "string", description: "The provider's NON-SECRET token ID. Omit to keep the current one." },
+      },
+      ["entry_id", "mode"],
+    ),
+  },
+  {
+    name: "admin_rotate_entry",
+    description:
+      "OWNER ONLY (local stdio): auto-rotate one entry now through its provider rotator. The new secret goes straight to the vault; the result is metadata only. Any remote caller is refused (tier 3).",
+    inputSchema: schema({ entry_id: { type: "string" } }, ["entry_id"]),
+  },
+  {
+    name: "admin_rotation_due",
+    description:
+      "OWNER ONLY (local stdio): list entries whose rotation is due (metadata only). Any remote caller is refused (tier 3).",
+    inputSchema: schema({}),
+  },
+  {
+    name: "admin_purge_entry",
+    description:
+      "OWNER ONLY (local stdio): IRREVERSIBLY destroy an entry — its stored secret, its row, its cards and all consent grants. confirm must be exactly \"PURGE <entry_id>\". Any remote caller is refused (tier 3).",
+    inputSchema: schema({ entry_id: { type: "string" }, confirm: { type: "string" } }, ["entry_id", "confirm"]),
   },
   {
     name: "credential_rotate",
@@ -1520,9 +1554,91 @@ const PLANNERS: Readonly<Record<string, Planner>> = Object.freeze({
       },
     };
   },
+  // Rotation + real delete (logic in rotation.ts / cards.ts). Results are metadata only.
+  admin_set_rotation: (a, env) => {
+    const entryId = reqStr(a, "entry_id");
+    const mode = reqStr(a, "mode") as "manual" | "auto";
+    const intervalDays = typeof a.interval_days === "number" ? a.interval_days : undefined;
+    const providerTokenId = optStr(a, "provider_token_id");
+    return {
+      capability: "vault.admin.entries.rotation.set",
+      resource: clip(`vault:entry/${sanitizeDisplayText(entryId, 40)}`, MAX_RESOURCE),
+      params: { entry_id: entryId, mode, interval_days: intervalDays, provider_token_id: providerTokenId },
+      summary: `Set rotation policy of ${clip(entryId, 40)}`,
+      run: async () => {
+        try {
+          const policy = { mode, interval_days: intervalDays, provider_token_id: providerTokenId };
+          return { result: { ok: true, data: await setEntryRotation(entryId, policy, rotationDeps(env)) } };
+        } catch (err) {
+          return { result: entryFailure(err) };
+        }
+      },
+    };
+  },
+  admin_rotate_entry: (a, env) => {
+    const entryId = reqStr(a, "entry_id");
+    return {
+      capability: "vault.admin.entries.rotate",
+      resource: clip(`vault:entry/${sanitizeDisplayText(entryId, 40)}`, MAX_RESOURCE),
+      params: { entry_id: entryId },
+      summary: `Rotate ${clip(entryId, 40)} now`,
+      run: async () => {
+        try {
+          return { result: { ok: true, data: await rotateEntry(entryId, rotationDeps(env)) } };
+        } catch (err) {
+          return { result: entryFailure(err) };
+        }
+      },
+    };
+  },
+  admin_rotation_due: (_a, env) => ({
+    capability: "vault.admin.entries.rotation.due",
+    resource: "entry:*",
+    params: {},
+    summary: "List entries due for rotation",
+    run: async () => {
+      try {
+        const entries = await listRotationDue((env.deps.now ?? Date.now)(), env.deps.cards);
+        return { result: { ok: true, data: { entries } } };
+      } catch (err) {
+        return { result: entryFailure(err) };
+      }
+    },
+  }),
+  admin_purge_entry: (a, env) => {
+    const entryId = reqStr(a, "entry_id");
+    const confirm = reqStr(a, "confirm");
+    return {
+      capability: "vault.admin.entries.purge",
+      resource: clip(`vault:entry/${sanitizeDisplayText(entryId, 40)}`, MAX_RESOURCE),
+      params: { entry_id: entryId },
+      summary: `PURGE ${clip(entryId, 40)} (irreversible)`,
+      run: async () => {
+        if (confirm !== `PURGE ${entryId}`) {
+          return { result: { ok: false, error: "confirmation_required", detail: 'confirm must be exactly "PURGE <entry_id>"' } };
+        }
+        try {
+          return { result: { ok: true, data: await purgeEntry(entryId, rotationDeps(env)) } };
+        } catch (err) {
+          return { result: entryFailure(err) };
+        }
+      },
+    };
+  },
   credential_rotate: (a) => tier3Plan("vault.secret.rotate", a),
   credential_revoke: (a) => tier3Plan("vault.secret.delete", a),
 });
+
+/** Wiring for rotation.ts: the gateway's entry stores, grant store and transport, ledgered under the caller. */
+function rotationDeps(env: Env): RotationDeps {
+  return {
+    ...env.deps.cards,
+    rotatorFetch: env.deps.fetch,
+    grants: env.deps.grants,
+    actor: env.identity.client_id,
+    ...(env.deps.now ? { now: env.deps.now } : {}),
+  };
+}
 
 /** Tier 3: the policy engine always denies; `run` exists only to fail closed if that ever changed. */
 function tier3Plan(capability: string, a: Record<string, unknown>): Plan {

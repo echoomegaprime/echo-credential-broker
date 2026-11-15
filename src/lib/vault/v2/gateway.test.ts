@@ -1146,6 +1146,10 @@ describe("owner-only admin surface (local stdio)", () => {
       ["admin_list_grants", {}],
       ["admin_revoke_grant", { client_id: "oc_x", entry_id: `ve_${"0".repeat(32)}` }],
       ["admin_list_entries", {}],
+      ["admin_set_rotation", { entry_id: `ve_${"0".repeat(32)}`, mode: "manual", interval_days: 30 }],
+      ["admin_rotate_entry", { entry_id: `ve_${"0".repeat(32)}` }],
+      ["admin_rotation_due", {}],
+      ["admin_purge_entry", { entry_id: `ve_${"0".repeat(32)}`, confirm: `PURGE ve_${"0".repeat(32)}` }],
     ];
     for (const who of [remote, workload]) {
       for (const [name, args] of calls) expectFail(await w.call(who, name, args), "tier3_human_only");
@@ -1173,5 +1177,93 @@ describe("owner-only admin surface (local stdio)", () => {
     const entries = expectOk(await w.call(local, "admin_list_entries", { site: "adm.com" })).entries as Array<Record<string, unknown>>;
     const e = entries.find((x) => x.account === "a");
     assert.ok(e && "fingerprint" in e && "secret_length" in e, "owner view includes fingerprint and length");
+  });
+
+  it("rotation + purge admin tools: owner-only, metadata-only results, agents stay tier-3 denied", async () => {
+    const w = makeWorld();
+    const agent = client("oc_agent", ["vault.read", "vault.write"]);
+    const tokenId = "0123456789abcdef0123456789abcdef";
+    const oldToken = "gw-old-cloudflare-token-AAAAAAAAAAAAA-01";
+    const newToken = "gw-new-cloudflare-token-BBBBBBBBBBBBB-02";
+    secretsToScan.add(oldToken);
+    secretsToScan.add(newToken);
+    const id = await seedEntry(w, agent, { site: "cloudflare.com", account: "ops", kind: "api_key", secret: oldToken });
+    const cfCalls: Array<{ url: string; method: string; auth: string }> = [];
+    const cfFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const auth = new Headers(init?.headers).get("authorization") ?? "";
+      cfCalls.push({ url: String(input), method: init?.method ?? "GET", auth });
+      if (auth !== `Bearer ${oldToken}`) return new Response(JSON.stringify({ success: false, errors: [{ message: auth }] }), { status: 401 });
+      return new Response(JSON.stringify({ success: true, errors: [], messages: [], result: newToken }), { status: 200 });
+    }) as typeof fetch;
+    const t0 = Date.now();
+    const deps = (now: number): GatewayDeps => ({ ...w.deps, fetch: cfFetch, now: () => now, cards: { ...w.deps.cards, now: () => now } });
+    const stored = async () => (await (w.deps.cards!.backend!).get(`echo_vault_entry_${id}`, "entry", "test")).secret;
+
+    // Policy: validation errors are sanitized codes; a refused policy changes nothing.
+    expectFail(await callWith(local, "admin_set_rotation", { entry_id: id, mode: "auto", interval_days: 30 }, deps(t0)), "rotation_unsupported");
+    expectFail(await callWith(local, "admin_set_rotation", { entry_id: id, mode: "hourly" }, deps(t0)), "invalid_arguments");
+    expectFail(await callWith(local, "admin_set_rotation", { entry_id: id, mode: "manual", provider_token_id: oldToken }, deps(t0)), "invalid_provider_token_id");
+    const set = expectOk(await callWith(local, "admin_set_rotation", { entry_id: id, mode: "auto", interval_days: 30, provider_token_id: tokenId }, deps(t0)));
+    assert.equal(set.auto_supported, true);
+    assert.equal((set.entry as Record<string, unknown>).rotation_mode, "auto");
+    assert.equal((set.entry as Record<string, unknown>).provider_token_id, tokenId);
+
+    // Due list.
+    assert.deepEqual(expectOk(await callWith(local, "admin_rotation_due", {}, deps(t0))).entries, []);
+    const later = t0 + 31 * 86_400_000;
+    const due = expectOk(await callWith(local, "admin_rotation_due", {}, deps(later))).entries as Array<Record<string, unknown>>;
+    assert.deepEqual(due.map((e) => e.id), [id]);
+
+    // Rotate: the new secret lands in the vault only; the result is metadata.
+    const rotated = expectOk(await callWith(local, "admin_rotate_entry", { entry_id: id }, deps(later)));
+    assert.deepEqual(cfCalls, [{ url: `https://api.cloudflare.com/client/v4/user/tokens/${tokenId}/value`, method: "PUT", auth: `Bearer ${oldToken}` }]);
+    assert.equal(await stored(), newToken);
+    assert.equal((rotated.entry as Record<string, unknown>).rotation_count, 1);
+    assert.equal(rotated.provider, "cloudflare");
+    assert.deepEqual(expectOk(await callWith(local, "admin_rotation_due", {}, deps(later))).entries, []);
+    expectFail(await callWith(local, "admin_rotate_entry", { entry_id: `ve_${"0".repeat(32)}` }, deps(later)), "entry_not_found");
+
+    // Agents: the rotate/revoke tools stay tier 3, and agent views never show rotation internals.
+    expectFail(await w.call(agent, "credential_rotate", { credential_ref: "vault://cloudflare/ops" }), "tier3_human_only");
+    expectFail(await w.call(agent, "credential_revoke", { credential_ref: "vault://cloudflare/ops" }), "tier3_human_only");
+    expectFail(await w.call(agent, "admin_rotate_entry", { entry_id: id }), "tier3_human_only");
+    expectFail(await w.call(agent, "admin_purge_entry", { entry_id: id, confirm: `PURGE ${id}` }), "tier3_human_only");
+    const seenByAgent = expectOk(await w.call(agent, "entry_list", { site: "cloudflare.com" })).entries as Array<Record<string, unknown>>;
+    assert.equal("provider_token_id" in seenByAgent[0], false);
+    assert.equal(await stored(), newToken, "a denied purge destroys nothing");
+
+    // Purge: refused without the exact confirmation, then irreversible.
+    await w.grants.add({
+      client_id: agent.client_id, entry_id: id, host: "api.cloudflare.com", path_prefix: "/client/v4/user", approval_id: "A".repeat(24),
+      granted_at: new Date(later).toISOString(), expires_at: new Date(later + 3_600_000).toISOString(), max_uses: null, uses_remaining: null,
+    });
+    for (const confirm of ["PURGE", "yes", `purge ${id}`, `PURGE ${id} `, `PURGE ve_${"0".repeat(32)}`]) {
+      expectFail(await callWith(local, "admin_purge_entry", { entry_id: id, confirm }, deps(later)), "confirmation_required");
+    }
+    expectFail(await callWith(local, "admin_purge_entry", { entry_id: id }, deps(later)), "invalid_arguments");
+    assert.equal(await stored(), newToken);
+    const purged = expectOk(await callWith(local, "admin_purge_entry", { entry_id: id, confirm: `PURGE ${id}` }, deps(later)));
+    assert.equal(purged.purged, true);
+    assert.equal(purged.secret_disposal, "overwritten");
+    assert.equal(purged.grants_removed, 1);
+    const filler = await stored();
+    assert.ok(filler !== newToken && filler !== oldToken && filler.length === 86, "the stored value was overwritten with random bytes");
+    secretsToScan.add(filler);
+    assert.equal((await w.grants.list({ entry_id: id })).length, 0);
+    assert.equal((await w.entries.list({ includeDeleted: true })).some((e) => e.id === id), false);
+    const use = { site: "cloudflare.com", account: "ops", method: "GET", host: "api.cloudflare.com", url_path: "/client/v4/user", task: "after purge" };
+    expectFail(await w.call(agent, "entry_use", use), "entry_not_found");
+    expectFail(await callWith(local, "admin_purge_entry", { entry_id: id, confirm: `PURGE ${id}` }, deps(later)), "entry_not_found");
+
+    const rows = await w.rows();
+    const caps = (c: string) => rows.filter((r) => r.capability === c);
+    assert.deepEqual(caps("vault.entry.rotate").map((r) => r.result), ["ok", "error"]);
+    assert.deepEqual(caps("vault.entry.purge").map((r) => r.result), ["ok", "error"]);
+    assert.equal(caps("vault.entry.purge")[0].resource, "entry:cloudflare.com/ops");
+    assert.equal(caps("vault.entry.purge")[0].client_id, "local:owner");
+    assert.ok(caps("vault.admin.entries.purge").some((r) => r.result === "ok" && r.client_id === "local:owner"));
+    assert.ok(caps("vault.admin.entries.purge").some((r) => r.result === "error" && r.error === "confirmation_required"));
+    assert.ok(caps("vault.admin.entries.rotate").some((r) => r.result === "ok"));
+    scan("ledger rows after rotation and purge", rows);
   });
 });

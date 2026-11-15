@@ -15,16 +15,19 @@ import {
   getCardStatus,
   getEntryMetadata,
   listEntries,
+  listRotationDue,
   lookupCard,
   markUsed,
   MAX_PENDING_CARDS_PER_CLIENT,
   MemoryCardStore,
   MemoryEntryStore,
   normalizeSite,
+  recordRotationError,
   requestCard,
   resolveEntry,
   secretFingerprint,
   setDefault,
+  setRotationPolicy,
   SqlCardStore,
   SqlEntryStore,
   submitCard,
@@ -548,6 +551,97 @@ function runSuite(name: string, makeStores: () => Promise<Stores>) {
       );
     });
 
+    it("rotation metadata: defaults, policy, re-entry counts as a manual rotation, listRotationDue", async () => {
+      const w = makeWorld(await makeStores());
+      const DAY = 86_400_000;
+      const a = await w.entered(CLAUDE, { site: "github.com", account: "bobmcw" }, SECRET_A);
+      const b = await w.entered(CLAUDE, { site: "github.com", account: "echo-bot" }, SECRET_B);
+      const picked = (e: EntryMetadata) => ({
+        rotation_mode: e.rotation_mode,
+        rotate_interval_days: e.rotate_interval_days,
+        last_rotated_at: e.last_rotated_at,
+        rotate_by: e.rotate_by,
+        rotation_count: e.rotation_count,
+        last_rotation_error: e.last_rotation_error,
+        provider_token_id: e.provider_token_id,
+      });
+      assert.deepEqual(picked(a), {
+        rotation_mode: "manual",
+        rotate_interval_days: null,
+        last_rotated_at: null,
+        rotate_by: null,
+        rotation_count: 0,
+        last_rotation_error: null,
+        provider_token_id: null,
+      });
+      assert.deepEqual(await listRotationDue(w.clock.t + 10_000 * DAY, w.deps), [], "no interval → never due");
+
+      // Policy: rotate_by = creation + interval while the entry was never rotated.
+      const set = w.keep(await setRotationPolicy(a.id, { mode: "manual", interval_days: 30, provider_token_id: "tok-id.1" }, w.deps));
+      assert.equal(set.rotate_interval_days, 30);
+      assert.equal(set.provider_token_id, "tok-id.1");
+      assert.equal(set.rotate_by, new Date(Date.parse(a.created_at) + 30 * DAY).toISOString());
+      // undefined keeps, null clears.
+      const kept = await setRotationPolicy(a.id, { mode: "manual" }, w.deps);
+      assert.equal(kept.rotate_interval_days, 30);
+      assert.equal(kept.provider_token_id, "tok-id.1");
+      assert.equal((await setRotationPolicy(a.id, { mode: "manual", provider_token_id: null }, w.deps)).provider_token_id, null);
+
+      await w.fails(setRotationPolicy(a.id, { mode: "weekly" as never }, w.deps), "invalid_rotation_mode");
+      await w.fails(setRotationPolicy(a.id, { mode: "manual", interval_days: 0 }, w.deps), "invalid_interval_days");
+      await w.fails(setRotationPolicy(a.id, { mode: "manual", interval_days: 3651 }, w.deps), "invalid_interval_days");
+      await w.fails(setRotationPolicy(a.id, { mode: "manual", interval_days: 1.5 }, w.deps), "invalid_interval_days");
+      await w.fails(setRotationPolicy(b.id, { mode: "auto" }, w.deps), "invalid_interval_days");
+      await w.fails(setRotationPolicy(a.id, { mode: "manual", provider_token_id: "has space" }, w.deps), "invalid_provider_token_id");
+      await w.fails(
+        setRotationPolicy(a.id, { mode: "manual", provider_token_id: "ghp_TESTONLYabcdefghijklmnopqrstu0001" }, w.deps),
+        "invalid_provider_token_id",
+      );
+      // The entry's own secret can never be filed as its "token id".
+      const idShaped = "idshaped-secret-0123456789abcdef";
+      const c = await w.entered(CLAUDE, { site: "gitlab.com", account: "bobmcw" }, idShaped);
+      await w.fails(setRotationPolicy(c.id, { mode: "manual", provider_token_id: idShaped }, w.deps), "invalid_provider_token_id");
+      await w.fails(setRotationPolicy("ve_" + "0".repeat(32), { mode: "manual" }, w.deps), "entry_not_found");
+
+      // Due list: only active entries whose rotate_by has passed.
+      assert.deepEqual(await listRotationDue(Date.parse(set.rotate_by!) - 1, w.deps), []);
+      assert.deepEqual((await listRotationDue(Date.parse(set.rotate_by!), w.deps)).map((e) => e.id), [a.id]);
+      await setRotationPolicy(b.id, { mode: "manual", interval_days: 1 }, w.deps);
+      assert.deepEqual((await listRotationDue(w.clock.t + 365 * DAY, w.deps)).map((e) => e.id), [b.id, a.id], "oldest due first");
+      await flagForReentry(b.id, "401", w.deps);
+      assert.deepEqual((await listRotationDue(w.clock.t + 365 * DAY, w.deps)).map((e) => e.id), [a.id], "needs_reentry is not listed");
+
+      // A failed attempt is recorded as a short code only.
+      await recordRotationError(a.id, "provider_http_403", w.deps);
+      assert.equal((await getEntryMetadata(a.id, w.deps))?.last_rotation_error, "provider_http_403");
+      await recordRotationError(a.id, `Bad credentials for ${SECRET_A}`, w.deps);
+      assert.equal((await getEntryMetadata(a.id, w.deps))?.last_rotation_error, "rotation_failed");
+
+      // A successful card re-entry IS a manual rotation.
+      w.clock.t += 40 * DAY;
+      await requestCard({ client: CLAUDE, site: "github.com", kind: "password", reason: "rotate", entry_id: a.id }, w.deps);
+      const done = await submitCard(w.lastToken(), { secret: SECRET_A2 }, w.deps);
+      assert.equal(done.ok, true);
+      const after = (await getEntryMetadata(a.id, w.deps))!;
+      const nowIso = new Date(w.clock.t).toISOString();
+      assert.equal(after.last_rotated_at, nowIso);
+      assert.equal(after.rotation_count, 1);
+      assert.equal(after.rotate_by, new Date(w.clock.t + 30 * DAY).toISOString());
+      assert.equal(after.last_rotation_error, null);
+      assert.equal(after.rotate_interval_days, 30, "policy survives a rotation");
+      assert.deepEqual(await listRotationDue(w.clock.t + 29 * DAY, w.deps), []);
+      // A later policy change counts from the last rotation, not from creation.
+      assert.equal(
+        (await setRotationPolicy(a.id, { mode: "manual", interval_days: 7 }, w.deps)).rotate_by,
+        new Date(w.clock.t + 7 * DAY).toISOString(),
+      );
+      // A soft-deleted entry is never due and cannot be given a policy.
+      await deleteEntry(a.id, w.deps);
+      assert.deepEqual(await listRotationDue(w.clock.t + 999 * DAY, w.deps), []);
+      await w.fails(setRotationPolicy(a.id, { mode: "manual" }, w.deps), "entry_not_found");
+      await assertNoLeak(w, "", [...ALL_SECRETS, idShaped]);
+    });
+
     it("delete affects exactly one entry", async () => {
       const w = makeWorld(await makeStores());
       const a = await w.entered(CLAUDE, { site: "github.com", account: "bobmcw" }, SECRET_A);
@@ -676,7 +770,9 @@ runSuite("sql stores on PGlite", async () => {
   pglite ??= (async () => {
     const { PGlite } = await import("@electric-sql/pglite");
     const pg = new PGlite();
-    await pg.exec(readFileSync(new URL("../../../../migrations/0005_vault_entries.sql", import.meta.url), "utf8"));
+    for (const file of ["0005_vault_entries.sql", "0007_vault_entry_rotation.sql"]) {
+      await pg.exec(readFileSync(new URL(`../../../../migrations/${file}`, import.meta.url), "utf8"));
+    }
     return pg;
   })();
   const pg = await pglite;
