@@ -1595,6 +1595,33 @@ describe("console pages", () => {
       resetOAuth();
     }
   });
+
+  it("the entries page shows a cookie entry's count, cookie names, domains and earliest expiry, never a value", async () => {
+    const { w, l } = await ready();
+    const values = ["console-cookie-sess-0001", "console/cookie+csrf=0002"];
+    for (const v of values) secretsToScan.add(v);
+    const expiry = Date.parse("2031-01-01T00:00:00Z") / 1000;
+    const exported = JSON.stringify([
+      { name: "session_id", value: values[0], domain: ".cookies.example.com", path: "/", secure: true, httpOnly: true, hostOnly: false, expirationDate: expiry },
+      { name: "csrftoken", value: values[1], domain: "cookies.example.com", path: "/", hostOnly: true, session: true },
+      { name: "lang", value: "en", domain: "cookies.example.com" },
+    ]);
+    const id = await w.seedEntry("cookies.example.com", "alice@example.com", "cookie", exported);
+    await w.seedEntry("cookies.example.com", "bob@example.com", "cookie", `session_id=${values[1]}`);
+    await w.seedEntry("plain.example.com", "svc", "api_key", "console-plain-api-key-0003");
+    const page = await w.send("GET", "/console/entries", { cookie: l.cookie });
+    assert.equal(page.status, 200);
+    const section = page.text.slice(page.text.indexOf(id) - 400, page.text.indexOf(id) + 1400);
+    assert.match(section, /<dt>Kind<\/dt><dd>cookie<\/dd>/);
+    assert.match(section, /<dt>Cookies<\/dt><dd>2 stored<\/dd>/);
+    assert.match(section, /<dt>Cookie names<\/dt><dd>csrftoken, session_id<\/dd>/);
+    assert.match(section, /<dt>Cookie domains<\/dt><dd>\.cookies\.example\.com, cookies\.example\.com<\/dd>/);
+    assert.ok(section.includes(`<dt>Earliest cookie expiry</dt><dd>${new Date(expiry * 1000).toISOString()}</dd>`));
+    // Both accounts of the site are listed; the non-cookie entry has no cookie rows.
+    assert.equal(page.text.split("<dt>Cookie names</dt>").length - 1, 2);
+    assert.ok(page.text.includes("session cookies only"));
+    for (const v of values) for (const form of variants(v)) assert.equal(page.text.includes(form), false, "a cookie value is on the entries page");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1743,7 +1770,8 @@ describe("migration 0011 on PGlite", () => {
     // It also applies as part of the full migration set, in order.
     const dir = new URL("../../../../migrations/", import.meta.url);
     const files = readdirSync(dir).filter((f) => f.endsWith(".sql")).sort();
-    assert.equal(files.at(-1), "0011_vault_owner_console.sql");
+    assert.equal(files.filter((f) => f <= "0011_vault_owner_console.sql").at(-1), "0011_vault_owner_console.sql");
+    assert.equal(files.at(-1), "0012_vault_cookie_entries.sql");
     assert.equal(files.filter((f) => f.startsWith("0011_")).length, 1);
     const { PGlite } = await import("@electric-sql/pglite");
     const all = new PGlite();

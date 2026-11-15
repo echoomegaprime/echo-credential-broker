@@ -40,15 +40,28 @@ import { log } from "../log.ts";
 import { containsSecretPrefix, redactString, redactValue, registerSecretForRedaction } from "../redaction.ts";
 import { approverTelegramId, constantTimeEqual, sanitizeDisplayText } from "./approvals.ts";
 import type { ClientIdentity, Decision, LedgerEntryInput, Tier } from "./contracts.ts";
+import {
+  CookieInputError,
+  describeJar,
+  jarRedactionForms,
+  MAX_COOKIE_JAR_CHARS,
+  parseCookieInput,
+  serializeJar,
+  type CookieJarSummary,
+} from "./cookie-jar.ts";
 import { appendLedger } from "./ledger.ts";
 
 // ---------------------------------------------------------------- types
 
-export type EntryKind = "password" | "api_key" | "oauth_token" | "operator_secret";
+/**
+ * "cookie": a browser session. The stored secret is the canonical cookie-jar JSON
+ * (cookie-jar.ts); every cookie VALUE in it is a secret like any password.
+ */
+export type EntryKind = "password" | "api_key" | "oauth_token" | "operator_secret" | "cookie";
 export type EntryStatus = "active" | "needs_reentry" | "deleted";
 export type RotationMode = "manual" | "auto";
 
-export const ENTRY_KINDS: readonly EntryKind[] = ["password", "api_key", "oauth_token", "operator_secret"];
+export const ENTRY_KINDS: readonly EntryKind[] = ["password", "api_key", "oauth_token", "operator_secret", "cookie"];
 
 /** Everything this module ever returns about an entry. No secret material. */
 export interface EntryMetadata {
@@ -84,6 +97,11 @@ export interface EntryMetadata {
   last_rotation_error: string | null;
   /** Provider-side NON-SECRET id needed to rotate (e.g. a Cloudflare API token id). Never a token value. */
   provider_token_id: string | null;
+  /**
+   * `cookie` entries only: count, cookie NAMES, domains and earliest expiry. Never a value.
+   * Owner-facing (console, admin_list_entries); gateway.ts agentEntryView does not pass it on.
+   */
+  cookie_jar?: CookieJarSummary;
 }
 
 export type CardStoredStatus = "pending" | "claimed" | "completed" | "expired";
@@ -133,6 +151,8 @@ export class CardError extends Error {
 export const CARD_TTL_MS = 30 * 60 * 1000;
 export const MIN_SECRET_LENGTH = 8; // redaction.ts only arms secrets of 8+ chars
 export const MAX_SECRET_LENGTH = 4096;
+/** `cookie` entries only: the canonical jar JSON may be this long (cookie-jar.ts MAX_COOKIE_JAR_CHARS). */
+export const MAX_COOKIE_SECRET_LENGTH = MAX_COOKIE_JAR_CHARS;
 export const MAX_PENDING_CARDS_PER_CLIENT = 5;
 const TOKEN_BYTES = 32; // 256 bits
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
@@ -257,7 +277,31 @@ function publicEntry(row: EntryMetadata): EntryMetadata {
     provider_token_id: row.provider_token_id,
   };
   if (row.reentry_reason) out.reentry_reason = row.reentry_reason;
+  if (row.kind === "cookie" && row.cookie_jar) out.cookie_jar = cloneSummary(row.cookie_jar);
   return out;
+}
+
+function cloneSummary(s: CookieJarSummary): CookieJarSummary {
+  return { ...s, names: [...s.names], domains: [...s.domains] };
+}
+
+/** Decode the `cookie_meta` column. Anything that is not the expected shape is dropped, never thrown. */
+function summaryFromColumn(raw: unknown): CookieJarSummary | undefined {
+  if (raw == null || raw === "") return undefined;
+  try {
+    const o = (typeof raw === "string" ? JSON.parse(raw) : raw) as Record<string, unknown>;
+    const strings = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : []);
+    return {
+      count: Number(o.count) || 0,
+      names: strings(o.names),
+      domains: strings(o.domains),
+      truncated: o.truncated === true,
+      expires_at: typeof o.expires_at === "string" ? o.expires_at : null,
+      session_cookies: Number(o.session_cookies) || 0,
+    };
+  } catch {
+    return undefined;
+  }
 }
 
 /** `fromIso` + N days, or null when there is no interval. */
@@ -285,6 +329,8 @@ export interface NewEntryRow {
   fingerprint: string;
   secret_length: number;
   nowIso: string;
+  /** `cookie` entries: jar metadata (names, domains, expiry — never values). */
+  cookie_jar?: CookieJarSummary;
 }
 
 export interface EntryStore {
@@ -307,7 +353,25 @@ export interface EntryStore {
    * This IS a rotation: last_rotated_at = now, rotation_count + 1, rotate_by = now + interval (or null),
    * last_rotation_error cleared.
    */
-  replaceSecretMeta(id: string, fingerprint: string, secretLength: number, nowIso: string): Promise<EntryMetadata | null>;
+  replaceSecretMeta(
+    id: string,
+    fingerprint: string,
+    secretLength: number,
+    nowIso: string,
+    cookie?: CookieJarSummary,
+  ): Promise<EntryMetadata | null>;
+  /**
+   * A `cookie` entry's jar was refreshed by the site (Set-Cookie): new fingerprint/length/jar
+   * metadata for the same ACTIVE entry. NOT a rotation: status, rotation state and verification
+   * are untouched. Null when the entry is missing, not active or not a cookie entry.
+   */
+  refreshJarMeta(
+    id: string,
+    fingerprint: string,
+    secretLength: number,
+    cookie: CookieJarSummary,
+    nowIso: string,
+  ): Promise<EntryMetadata | null>;
   flag(id: string, reason: string, nowIso: string): Promise<EntryMetadata | null>;
   markDeleted(id: string, nowIso: string): Promise<EntryMetadata | null>;
   touchUsed(id: string, nowIso: string): Promise<EntryMetadata | null>;
@@ -375,6 +439,7 @@ export class MemoryEntryStore implements EntryStore {
       last_rotation_error: null,
       provider_token_id: null,
     };
+    if (row.kind === "cookie" && row.cookie_jar) rec.cookie_jar = cloneSummary(row.cookie_jar);
     this.rows.set(rec.id, rec);
     return { ...rec };
   }
@@ -434,11 +499,13 @@ export class MemoryEntryStore implements EntryStore {
     fingerprint: string,
     secretLength: number,
     nowIso: string,
+    cookie?: CookieJarSummary,
   ): Promise<EntryMetadata | null> {
     const rec = this.rows.get(id);
     if (!rec || rec.status === "deleted") return null;
     rec.fingerprint = fingerprint;
     rec.secret_length = secretLength;
+    if (rec.kind === "cookie" && cookie) rec.cookie_jar = cloneSummary(cookie);
     rec.status = "active";
     delete rec.reentry_reason;
     rec.last_verified_at = null;
@@ -446,6 +513,22 @@ export class MemoryEntryStore implements EntryStore {
     rec.rotation_count += 1;
     rec.rotate_by = rotateByFrom(nowIso, rec.rotate_interval_days);
     rec.last_rotation_error = null;
+    rec.updated_at = nowIso;
+    return { ...rec };
+  }
+
+  async refreshJarMeta(
+    id: string,
+    fingerprint: string,
+    secretLength: number,
+    cookie: CookieJarSummary,
+    nowIso: string,
+  ): Promise<EntryMetadata | null> {
+    const rec = this.rows.get(id);
+    if (!rec || rec.status !== "active" || rec.kind !== "cookie") return null;
+    rec.fingerprint = fingerprint;
+    rec.secret_length = secretLength;
+    rec.cookie_jar = cloneSummary(cookie);
     rec.updated_at = nowIso;
     return { ...rec };
   }
@@ -528,7 +611,7 @@ function violates(err: unknown, constraint: string): boolean {
 const ENTRY_COLUMNS =
   "id, site, account, purpose, label, kind, is_default, status, fingerprint, secret_length, reentry_reason, " +
   "created_at, updated_at, last_used_at, last_verified_at, rotation_mode, rotate_interval_days, last_rotated_at, " +
-  "rotate_by, rotation_count, last_rotation_error, provider_token_id";
+  "rotate_by, rotation_count, last_rotation_error, provider_token_id, cookie_meta";
 
 function rowToEntry(row: Record<string, unknown>): EntryMetadata {
   const rec: EntryMetadata = {
@@ -556,6 +639,8 @@ function rowToEntry(row: Record<string, unknown>): EntryMetadata {
     provider_token_id: row.provider_token_id == null ? null : String(row.provider_token_id),
   };
   if (row.reentry_reason != null && row.reentry_reason !== "") rec.reentry_reason = String(row.reentry_reason);
+  const cookie = rec.kind === "cookie" ? summaryFromColumn(row.cookie_meta) : undefined;
+  if (cookie) rec.cookie_jar = cookie;
   return rec;
 }
 
@@ -580,10 +665,11 @@ export class SqlEntryStore implements EntryStore {
       try {
         const rows = await sql.query<Record<string, unknown>>(
           `insert into vault_entries
-             (id, site, account, purpose, label, kind, is_default, status, fingerprint, secret_length, created_at, updated_at)
+             (id, site, account, purpose, label, kind, is_default, status, fingerprint, secret_length, created_at, updated_at,
+              cookie_meta)
            select $1::text, $2::text, $3::text, $4::text, $5::text, $6::text,
                   ($10::boolean and not exists (select 1 from vault_entries where site = $2::text and is_default)),
-                  'active', $7::text, $8::integer, $9::timestamptz, $9::timestamptz
+                  'active', $7::text, $8::integer, $9::timestamptz, $9::timestamptz, $11::text
            returning ${ENTRY_COLUMNS}`,
           [
             row.id,
@@ -596,6 +682,7 @@ export class SqlEntryStore implements EntryStore {
             row.secret_length,
             row.nowIso,
             allowDefault,
+            row.kind === "cookie" && row.cookie_jar ? JSON.stringify(row.cookie_jar) : null,
           ],
         );
         if (rows[0]) return rowToEntry(rows[0]);
@@ -668,17 +755,40 @@ export class SqlEntryStore implements EntryStore {
     }
   }
 
-  replaceSecretMeta(id: string, fingerprint: string, secretLength: number, nowIso: string): Promise<EntryMetadata | null> {
+  replaceSecretMeta(
+    id: string,
+    fingerprint: string,
+    secretLength: number,
+    nowIso: string,
+    cookie?: CookieJarSummary,
+  ): Promise<EntryMetadata | null> {
     return this.one(
       `update vault_entries
           set fingerprint = $2::text, secret_length = $3::integer, status = 'active', reentry_reason = null,
+              cookie_meta = case when kind = 'cookie' then coalesce($5::text, cookie_meta) else null end,
               last_verified_at = null, updated_at = $4::timestamptz,
               last_rotated_at = $4::timestamptz, rotation_count = rotation_count + 1, last_rotation_error = null,
               rotate_by = case when rotate_interval_days is null then null
                                else $4::timestamptz + make_interval(days => rotate_interval_days) end
         where id = $1::text and status <> 'deleted'
         returning ${ENTRY_COLUMNS}`,
-      [id, fingerprint, secretLength, nowIso],
+      [id, fingerprint, secretLength, nowIso, cookie ? JSON.stringify(cookie) : null],
+    );
+  }
+
+  refreshJarMeta(
+    id: string,
+    fingerprint: string,
+    secretLength: number,
+    cookie: CookieJarSummary,
+    nowIso: string,
+  ): Promise<EntryMetadata | null> {
+    return this.one(
+      `update vault_entries
+          set fingerprint = $2::text, secret_length = $3::integer, cookie_meta = $4::text, updated_at = $5::timestamptz
+        where id = $1::text and status = 'active' and kind = 'cookie'
+        returning ${ENTRY_COLUMNS}`,
+      [id, fingerprint, secretLength, JSON.stringify(cookie), nowIso],
     );
   }
 
@@ -1767,7 +1877,10 @@ export interface CardSubmission {
   site?: string;
   account?: string;
   purpose?: string;
-  secret: string;
+  /** The typed secret. For a `cookie` card: the pasted cookies (any format parseCookieInput accepts). */
+  secret?: string;
+  /** `cookie` cards only (the JSON submit): a cookie-object array, or a string in any accepted format. Wins over `secret`. */
+  cookies?: unknown;
 }
 
 export type CardSubmitFailure =
@@ -1781,12 +1894,20 @@ export type CardSubmitFailure =
   | "store_failed";
 
 export type CardSubmitResult =
-  | { ok: true; entry: EntryMetadata; reentry: boolean }
+  | {
+      ok: true;
+      entry: EntryMetadata;
+      reentry: boolean;
+      /** `cookie` cards: how many cookies were stored and how many were left out, by reason. Counts only. */
+      cookies?: { stored: number; skipped: { short_value: number; expired: number; other_site: number } };
+    }
   | {
       ok: false;
       code: CardSubmitFailure;
       /** Fixed, safe text. Never contains submitted content. */
       message: string;
+      /** A finer fixed code (e.g. a cookie-jar.ts parse code such as "invalid_cookie_value"). Never submitted content. */
+      detail?: string;
       /** Present when the card is still pending and the form can be shown again. */
       card?: CardView;
     };
@@ -1811,13 +1932,23 @@ export async function submitCard(token: string, submission: CardSubmission, deps
     return { ok: false, code, message: "This card link is invalid, expired or already used." };
   }
   const view = cardView(card);
-  const retry = (code: CardSubmitFailure, message: string): CardSubmitResult => ({ ok: false, code, message, card: view });
+  const retry = (code: CardSubmitFailure, message: string, detail?: string): CardSubmitResult =>
+    detail ? { ok: false, code, message, detail, card: view } : { ok: false, code, message, card: view };
 
+  const cookieCard = card.kind === "cookie";
   // The secret: armed for redaction before anything else can fail around it.
-  const secret = typeof submission?.secret === "string" ? submission.secret.trim() : "";
-  if (secret.length >= MIN_SECRET_LENGTH) registerSecretForRedaction(secret);
-  if (secret.length < MIN_SECRET_LENGTH || secret.length > MAX_SECRET_LENGTH) {
-    return retry("invalid_input", `The secret must be ${MIN_SECRET_LENGTH}-${MAX_SECRET_LENGTH} characters.`);
+  let secret = "";
+  let pasted: unknown;
+  if (cookieCard) {
+    pasted = submission?.cookies !== undefined ? submission.cookies : submission?.secret;
+    if (typeof pasted === "string" && pasted.trim().length >= MIN_SECRET_LENGTH) registerSecretForRedaction(pasted);
+  } else {
+    if (submission?.cookies !== undefined) return retry("invalid_input", "This card is not for cookies.", "card_kind_not_cookie");
+    secret = typeof submission?.secret === "string" ? submission.secret.trim() : "";
+    if (secret.length >= MIN_SECRET_LENGTH) registerSecretForRedaction(secret);
+    if (secret.length < MIN_SECRET_LENGTH || secret.length > MAX_SECRET_LENGTH) {
+      return retry("invalid_input", `The secret must be ${MIN_SECRET_LENGTH}-${MAX_SECRET_LENGTH} characters.`);
+    }
   }
 
   let target: EntryMetadata | null = null;
@@ -1839,8 +1970,36 @@ export async function submitCard(token: string, submission: CardSubmission, deps
     } catch (err) {
       return retry("invalid_input", err instanceof EntryError ? err.message : "A field is invalid.");
     }
+  }
+
+  // `cookie` cards: the paste becomes the canonical jar JSON, bound to this site. A rejected
+  // paste yields a fixed code; nothing that was typed is ever part of the result.
+  let cookieSummary: CookieJarSummary | undefined;
+  let cookieCounts: { stored: number; skipped: { short_value: number; expired: number; other_site: number } } | undefined;
+  let secretParts: string[] = [secret];
+  if (cookieCard) {
+    try {
+      const parsed = parseCookieInput(pasted, { site, now: c.nowMs });
+      for (const form of jarRedactionForms(parsed.jar)) registerSecretForRedaction(form);
+      secret = serializeJar(parsed.jar);
+      registerSecretForRedaction(secret);
+      cookieSummary = describeJar(parsed.jar, site);
+      cookieCounts = { stored: parsed.jar.cookies.length, skipped: parsed.skipped };
+      secretParts = parsed.jar.cookies.map((k) => k.value);
+    } catch (err) {
+      const detail = err instanceof CookieInputError ? err.code : "invalid_cookie_input";
+      log.warn("vault_card_cookie_rejected", { card_id: card.id, code: detail });
+      return retry(
+        "invalid_input",
+        `The cookies were not accepted (${detail}). Paste a Cookie header, a JSON cookie export or a Netscape cookies.txt.`,
+        detail,
+      );
+    }
+  }
+
+  if (!card.is_reentry) {
     // A secret pasted into the wrong field must not become metadata.
-    if ([site, account, purpose].some((v) => v.includes(secret))) {
+    if ([site, account, purpose].some((v) => secretParts.some((part) => v.includes(part)))) {
       return retry("invalid_input", "The secret must only be typed in the secret field.");
     }
     if (await c.entries.findIdentity(site, account, card.kind)) {
@@ -1876,7 +2035,7 @@ export async function submitCard(token: string, submission: CardSubmission, deps
       throw new EntryError("vault_unavailable", "vault write failed");
     }
     if (target) {
-      const updated = await c.entries.replaceSecretMeta(id, fingerprint, secret.length, c.nowIso);
+      const updated = await c.entries.replaceSecretMeta(id, fingerprint, secret.length, c.nowIso, cookieSummary);
       if (!updated) throw new EntryError("entry_gone", "entry vanished");
       entry = updated;
     } else {
@@ -1890,6 +2049,7 @@ export async function submitCard(token: string, submission: CardSubmission, deps
         fingerprint,
         secret_length: secret.length,
         nowIso: c.nowIso,
+        cookie_jar: cookieSummary,
       });
     }
   } catch (err) {
@@ -1927,5 +2087,60 @@ export async function submitCard(token: string, submission: CardSubmission, deps
     site: entry.site,
     reentry: target !== null,
   });
-  return { ok: true, entry: publicEntry(entry), reentry: target !== null };
+  return cookieCounts
+    ? { ok: true, entry: publicEntry(entry), reentry: target !== null, cookies: cookieCounts }
+    : { ok: true, entry: publicEntry(entry), reentry: target !== null };
+}
+
+/**
+ * SERVER-INTERNAL (gateway.ts entry_use): a site answered a `cookie` entry's
+ * request with Set-Cookie and the merged jar differs from the stored one. Write
+ * the new canonical jar to the vault backend and refresh the entry's
+ * fingerprint/length/jar metadata, so the next use sends the rotated session.
+ *
+ * Never throws and never fails the request that triggered it: the outcome is
+ * logged and ledgered ("vault.entry.cookie_refresh": ok, or error
+ * cookie_jar_persist_failed / cookie_jar_too_large). `jarJson` is a secret; it
+ * goes to the backend only.
+ */
+export async function refreshCookieJar(
+  id: string,
+  client: ClientIdentity,
+  jarJson: string,
+  summary: CookieJarSummary,
+  deps: CardsDeps = {},
+): Promise<boolean> {
+  const c = ctx(deps);
+  registerSecretForRedaction(jarJson);
+  let row: EntryMetadata | null = null;
+  let error: string | null = null;
+  try {
+    row = typeof id === "string" && ENTRY_ID_PATTERN.test(id) ? await c.entries.get(id) : null;
+    if (!row || row.status !== "active" || row.kind !== "cookie") error = "cookie_jar_persist_failed";
+    else if (jarJson.length < MIN_SECRET_LENGTH || jarJson.length > MAX_COOKIE_SECRET_LENGTH) error = "cookie_jar_too_large";
+    else {
+      await storeEntrySecret(c, row, jarJson);
+      const updated = await c.entries.refreshJarMeta(row.id, secretFingerprint(jarJson), jarJson.length, summary, c.nowIso);
+      if (!updated) error = "cookie_jar_persist_failed";
+    }
+  } catch {
+    error = "cookie_jar_persist_failed";
+  }
+  if (error) log.error("vault_entry_cookie_refresh_failed", { entry_id: row?.id ?? "unknown", error });
+  else log.info("vault_entry_cookie_refreshed", { entry_id: row?.id, site: row?.site, cookies: summary.count });
+  await writeLedger(
+    c,
+    {
+      client_id: typeof client?.client_id === "string" ? client.client_id : "unknown",
+      capability: "vault.entry.cookie_refresh",
+      resource: row ? entryResource(row.site, row.account) : "entry:unknown",
+      credential_ref: row ? entryRef(row.id) : undefined,
+      decision: "allow",
+      tier: 1,
+      result: error ? "error" : "ok",
+      error: error ?? undefined,
+    },
+    false,
+  );
+  return error === null;
 }

@@ -490,11 +490,21 @@ async function entriesPage(v: View): Promise<Response> {
         input("interval_days", "Rotate every N days (blank = keep)", { value: x.rotate_interval_days ?? "", max: 4 }) +
         input("provider_token_id", "Provider token ID — the non-secret ID, never the token (blank = keep)", { max: 64 }) +
         `</fieldset>`;
+      // `cookie` entries: jar metadata only — count, cookie NAMES, domains, earliest expiry. Never a value.
+      const jar = x.kind === "cookie" && x.cookie_jar && typeof x.cookie_jar === "object" ? (x.cookie_jar as Record<string, unknown>) : null;
+      const joined = (v: unknown) => (Array.isArray(v) && v.length ? v.map(String).join(", ") : "—");
+      const cookieRows = jar
+        ? `<dt>Cookies</dt><dd>${txt(jar.count)} stored${jar.truncated === true ? " (lists below are shortened)" : ""}</dd>` +
+          `<dt>Cookie names</dt><dd>${txt(joined(jar.names))}</dd>` +
+          `<dt>Cookie domains</dt><dd>${txt(joined(jar.domains))}</dd>` +
+          `<dt>Earliest cookie expiry</dt><dd>${txt(jar.expires_at ?? "session cookies only")}</dd>`
+        : "";
       return (
         `<section aria-label="${e(x.label)}"><h2>${txt(x.label)}</h2><dl>` +
         `<dt>Entry ID</dt><dd>${txt(id)}</dd><dt>Kind</dt><dd>${txt(x.kind)}</dd>` +
         `<dt>Status</dt><dd>${x.status === "active" ? txt(x.status) : `<span class="bad">${txt(x.status)}</span>`}${x.reentry_reason ? ` — ${txt(x.reentry_reason)}` : ""}</dd>` +
         `<dt>Fingerprint</dt><dd>${txt(x.fingerprint)}</dd><dt>Secret length</dt><dd>${txt(x.secret_length)} characters</dd>` +
+        cookieRows +
         `<dt>Default for site</dt><dd>${x.is_default ? "yes" : "no"}</dd>` +
         `<dt>Rotation</dt><dd>${txt(x.rotation_mode)}, every ${txt(x.rotate_interval_days)} days, due ${txt(x.rotate_by)}, last ${txt(x.last_rotated_at)}, count ${txt(x.rotation_count)}` +
         `${x.last_rotation_error ? `, <span class="bad">last error ${txt(x.last_rotation_error)}</span>` : ""}</dd>` +

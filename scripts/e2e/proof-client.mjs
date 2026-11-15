@@ -38,7 +38,7 @@ export const DEFAULT_SCOPES = "vault.read vault.write audit.read";
 const REDIRECT_URI = "http://127.0.0.1:53682/callback";
 const REQUEST_TIMEOUT_MS = 30_000;
 const MCP_PROTOCOL_VERSION = "2025-06-18";
-const ENTRY_KINDS = ["password", "api_key", "oauth_token"];
+const ENTRY_KINDS = ["password", "api_key", "oauth_token", "cookie"];
 
 const USAGE = `ECHO Vault end-to-end proof client
 
@@ -51,7 +51,7 @@ Required
 
 Options
   --account <name>       Account of the entry (default: proof).
-  --kind <kind>          api_key | oauth_token | password (default: api_key).
+  --kind <kind>          api_key | oauth_token | password | cookie (default: api_key).
   --path <path>          Path for the entry_use GET on the entry's own site (default: /).
   --scopes "<a b c>"     Scopes to request (default: "${DEFAULT_SCOPES}").
   --timeout-s <n>        How long to wait for each owner action (default: 900).

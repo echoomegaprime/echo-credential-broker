@@ -692,7 +692,7 @@ purgeSuite("memory stores", async () => memoryStores());
 
 // SQL stores against a real (embedded) Postgres with the real migrations.
 let pglite: Promise<import("@electric-sql/pglite").PGlite> | null = null;
-const MIGRATIONS = ["0005_vault_entries.sql", "0006_vault_entry_grants.sql", "0007_vault_entry_rotation.sql"];
+const MIGRATIONS = ["0005_vault_entries.sql", "0006_vault_entry_grants.sql", "0007_vault_entry_rotation.sql", "0012_vault_cookie_entries.sql"];
 function migration(file: string): string {
   return readFileSync(new URL(`../../../../migrations/${file}`, import.meta.url), "utf8");
 }
