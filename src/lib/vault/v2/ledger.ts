@@ -303,7 +303,8 @@ function backoff(attempt: number): Promise<void> {
 }
 
 export class Ledger {
-  private readonly store: LedgerStore;
+  /** Read access for ledger-anchor.ts (head/scan only; appends go through `append`). */
+  readonly store: LedgerStore;
   private readonly hmacKey: Buffer | null;
   private readonly now: () => number;
   private readonly newId: () => string;
@@ -595,6 +596,11 @@ function getDefaultLedger(): Ledger {
 export function configureLedger(opts: LedgerOptions): Ledger {
   defaultLedger = new Ledger(opts);
   return defaultLedger;
+}
+
+/** The process-wide ledger instance (ledger-anchor.ts verifies and reads its head). */
+export function getLedger(): Ledger {
+  return getDefaultLedger();
 }
 
 export function resetLedgerForTests(): void {

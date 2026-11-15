@@ -20,6 +20,7 @@ import { handleCardRequest } from "./card-pages.ts";
 import { MemoryCardStore, MemoryEntryStore, type CardsDeps } from "./cards.ts";
 import type { ClientIdentity } from "./contracts.ts";
 import { MemoryEntryGrantStore, revokeEntryGrant } from "./entry-grants.ts";
+import { MemoryAnchorStore } from "./ledger-anchor.ts";
 import { dispatchTool, isForbiddenToolName, listTools, TOOL_DEFINITIONS, type GatewayDeps, type GatewayResult } from "./gateway.ts";
 import { InstallationTokenCache } from "./github-app.ts";
 import { handleMcpGet, handleMcpPost, handleRestTool } from "./http-transport.ts";
@@ -150,6 +151,7 @@ function makeWorld() {
   const ledger = new Ledger({ store: ledgerStore });
   const approvalStore = new MemoryApprovalStore();
   const grants = new MemoryEntryGrantStore();
+  const anchors = new MemoryAnchorStore();
   const entries = new MemoryEntryStore();
   const cards: CardsDeps = {
     entries,
@@ -164,6 +166,7 @@ function makeWorld() {
     listLedger: (opts) => ledger.list(opts),
     verifyLedger: () => ledger.verify(),
     ledgerHead: () => ledger.head(),
+    anchor: { ledger, anchors, fetch: telegramFetch, env: ENV },
     approvals: { store: approvalStore, fetch: telegramFetch, env: ENV },
     rules: [],
     store,
@@ -217,7 +220,7 @@ function makeWorld() {
   };
 
   const rows = () => ledgerStore.scanAscending(0, 10_000);
-  return { deps, call, tap, fillLatestCard, telegram, site, githubCalls, ledger, ledgerStore, rows, grants, entries, store, approvalStore };
+  return { deps, call, tap, fillLatestCard, telegram, site, githubCalls, ledger, ledgerStore, rows, grants, entries, store, approvalStore, anchors };
 }
 
 function client(id: string, scopes: string[], kind: ClientIdentity["kind"] = "oauth"): ClientIdentity {
@@ -1279,10 +1282,14 @@ describe("owner-only admin surface (local stdio)", () => {
       ["admin_rotate_entry", { entry_id: `ve_${"0".repeat(32)}` }],
       ["admin_rotation_due", {}],
       ["admin_purge_entry", { entry_id: `ve_${"0".repeat(32)}`, confirm: `PURGE ve_${"0".repeat(32)}` }],
+      ["admin_anchor_now", {}],
+      ["admin_verify_anchor", { line: "ECHO-VAULT-ANCHOR v1 seq=1 hash=" + "0".repeat(64) + " rows=1 at=2026-11-14T10:00:00.000Z unsigned" }],
     ];
     for (const who of [remote, workload]) {
       for (const [name, args] of calls) expectFail(await w.call(who, name, args), "tier3_human_only");
     }
+    assert.equal(w.telegram.length, 0, "a refused admin_anchor_now sends nothing");
+    assert.equal(w.anchors.size, 0);
     assert.ok((await w.rows()).every((r) => r.decision === "deny" && r.tier === 3));
   });
 
@@ -1394,5 +1401,65 @@ describe("owner-only admin surface (local stdio)", () => {
     assert.ok(caps("vault.admin.entries.purge").some((r) => r.result === "error" && r.error === "confirmation_required"));
     assert.ok(caps("vault.admin.entries.rotate").some((r) => r.result === "ok"));
     scan("ledger rows after rotation and purge", rows);
+  });
+
+  it("admin_anchor_now anchors the head; audit_verify reports the newest anchor's verdict; admin_verify_anchor checks a line", async () => {
+    const w = makeWorld();
+    const reader = client("oc_auditor", ["audit.read", "vault.read"]);
+    const before = expectOk(await w.call(reader, "audit_verify"));
+    assert.equal(before.ok, true);
+    assert.equal(before.anchor, null, "nothing anchored yet");
+    assert.ok("head" in before && before.count === 0, "existing audit_verify fields are unchanged");
+
+    const anchored = expectOk(await w.call(local, "admin_anchor_now"));
+    assert.equal(anchored.status, "anchored");
+    assert.equal(anchored.seq, 1);
+    assert.equal(anchored.signed, false);
+    assert.equal(w.telegram.length, 1);
+    const line = String(w.telegram[0].payload.text);
+    assert.match(line, /^ECHO-VAULT-ANCHOR v1 seq=1 hash=[0-9a-f]{64} rows=1 at=\S+ unsigned$/);
+    assert.ok(!/oc_auditor|audit\.verify|local:owner/.test(line), "no ledger payload in the anchor message");
+
+    const after = expectOk(await w.call(reader, "audit_verify"));
+    assert.deepEqual(Object.keys(after).sort(), ["anchor", "count", "head", "ok"]);
+    const anchor = after.anchor as { seq: number; anchored_at: string; verdict: string };
+    assert.deepEqual(Object.keys(anchor).sort(), ["anchored_at", "seq", "verdict"]);
+    assert.equal(anchor.seq, 1);
+    assert.equal(anchor.verdict, "ok");
+
+    const checked = expectOk(await w.call(local, "admin_verify_anchor", { line }));
+    assert.equal(checked.verdict, "ok");
+    assert.equal(checked.known_locally, true);
+    expectFail(await w.call(local, "admin_verify_anchor", { line: "ECHO-VAULT-ANCHOR v1 seq=1" }), "anchor_line_invalid");
+    expectFail(await w.call(local, "admin_verify_anchor", {}), "invalid_arguments");
+
+    // The whole ledger is wiped: the (now empty, then regrown) chain still verifies, the anchor does not.
+    const total = (await w.rows()).length;
+    for (let seq = total; seq >= 1; seq -= 1) w.ledgerStore.deleteForTests(seq);
+    const cut = expectOk(await w.call(reader, "audit_verify"));
+    assert.equal(cut.ok, true, "the hash chain alone cannot see the truncation");
+    assert.equal((cut.anchor as { verdict: string }).verdict, "truncated");
+    // That audit_verify call was itself ledgered, so seq 1 now holds a different row than the one anchored.
+    assert.equal(expectOk(await w.call(local, "admin_verify_anchor", { line })).verdict, "rewritten");
+    const refused = expectFail(await w.call(local, "admin_anchor_now"), "ledger_rewritten");
+    assert.equal(refused.alert_sent, true);
+    assert.match(String(w.telegram[w.telegram.length - 1].payload.text), /^ECHO-VAULT-ANCHOR ALERT v1 reason=rewritten seq=1 /);
+    assert.equal(w.anchors.size, 1);
+  });
+
+  it("audit_verify reports truncated when rows after the anchor are deleted", async () => {
+    const w = makeWorld();
+    const reader = client("oc_auditor", ["audit.read", "vault.read"]);
+    for (let i = 0; i < 3; i += 1) expectOk(await w.call(reader, "vault_status"));
+    expectOk(await w.call(local, "admin_anchor_now"));
+    const total = (await w.rows()).length; // 3 reads + the admin_anchor_now row (written after the anchor was taken)
+    assert.equal(total, 4);
+    assert.equal(((await w.anchors.latest("telegram")) as { seq: number }).seq, 3);
+    w.ledgerStore.deleteForTests(4);
+    w.ledgerStore.deleteForTests(3);
+    w.ledgerStore.deleteForTests(2);
+    const cut = expectOk(await w.call(reader, "audit_verify"));
+    assert.equal(cut.ok, true);
+    assert.equal((cut.anchor as { verdict: string }).verdict, "truncated");
   });
 });
