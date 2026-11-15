@@ -13,3 +13,4 @@ screenshots/
 dist/
 coverage/
 tmp/
+.vault-data/

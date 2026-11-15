@@ -105,19 +105,134 @@ function createNeonSql(): Promise<Sql> {
   return globalRef.__pgSqlPromise__;
 }
 
+/**
+ * True when this module was transformed by Vite (dev server or a build).
+ * Vite defines `import.meta.env` and rewrites `import.meta.glob(...)` calls at
+ * transform time; under plain `node` (the stdio MCP transport, `node --test`)
+ * neither exists, so migrations are read from disk instead.
+ */
+const underVite = typeof import.meta.env !== "undefined";
+
+/**
+ * Where the embedded PGLite keeps its files, or null for an in-memory database.
+ *   - `ECHO_VAULT_DATA_DIR` set  → `<that dir>/pglite` (any runtime).
+ *   - plain node, unset          → `<repo>/.vault-data/pglite` (gitignored), so
+ *     the stdio transport's ledger, approvals, entries and grants survive
+ *     restarts. Resolved from this file, not the cwd an MCP client spawned us in.
+ *   - Vite dev/preview, unset    → in-memory (the template's preview contract).
+ *   - `node --test`, unset       → in-memory, so a test can never write into the
+ *     operator's real data directory.
+ */
+async function pgliteDataDir(): Promise<string | null> {
+  const configured = process.env.ECHO_VAULT_DATA_DIR?.trim();
+  if (!configured && (underVite || process.env.NODE_TEST_CONTEXT)) return null;
+  const { resolve, join, dirname } = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const base = configured
+    ? resolve(configured)
+    : join(dirname(fileURLToPath(import.meta.url)), "..", "..", ".vault-data");
+  return join(base, "pglite");
+}
+
+/**
+ * PGLite is single-process: two processes opening one data directory corrupt
+ * it. Take a pid lock next to the directory; a lock left by a dead process is
+ * replaced. A second live process fails with a clear, catchable error.
+ */
+async function lockDataDir(dir: string): Promise<void> {
+  const { mkdirSync, openSync, writeSync, closeSync, readFileSync, rmSync } = await import("node:fs");
+  const { dirname } = await import("node:path");
+  mkdirSync(dirname(dir), { recursive: true, mode: 0o700 });
+  const lockPath = `${dir}.lock`;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const fd = openSync(lockPath, "wx", 0o600);
+      writeSync(fd, String(process.pid));
+      closeSync(fd);
+      process.once("exit", () => {
+        try {
+          rmSync(lockPath, { force: true });
+        } catch {
+          // best effort
+        }
+      });
+      return;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      let owner = Number.NaN;
+      try {
+        owner = Number(readFileSync(lockPath, "utf8").trim());
+      } catch {
+        // unreadable lock: treat as stale
+      }
+      let alive = false;
+      if (Number.isInteger(owner) && owner > 0 && owner !== process.pid) {
+        try {
+          process.kill(owner, 0);
+          alive = true;
+        } catch (probe) {
+          alive = (probe as NodeJS.ErrnoException).code === "EPERM";
+        }
+      }
+      if (alive) {
+        throw Object.assign(
+          new Error(
+            `vault_data_dir_in_use: ${dir} is open in process ${owner}. Run one local vault process at a time, ` +
+              "or set DATABASE_URL so several processes share one Postgres database.",
+          ),
+          { code: "vault_data_dir_in_use" },
+        );
+      }
+      rmSync(lockPath, { force: true });
+    }
+  }
+  throw Object.assign(new Error("vault_data_dir_lock_failed"), { code: "vault_data_dir_lock_failed" });
+}
+
+/** `migrations/*.sql` (top level only), keyed by path. */
+async function loadMigrations(): Promise<Record<string, string>> {
+  if (underVite) {
+    // Inlined by the bundler (no runtime fs). The glob does not descend, so the
+    // opt-in auth schema under migrations/auth/ stays out.
+    return import.meta.glob("/migrations/*.sql", {
+      query: "?raw",
+      import: "default",
+      eager: true,
+    }) as Record<string, string>;
+  }
+  // Plain node: read the same directory, same non-recursive scope.
+  const { readdir, readFile } = await import("node:fs/promises");
+  const { join, dirname, resolve } = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const configured = process.env.ECHO_VAULT_MIGRATIONS_DIR?.trim();
+  const dir = configured
+    ? resolve(configured)
+    : join(dirname(fileURLToPath(import.meta.url)), "..", "..", "migrations");
+  const out: Record<string, string> = {};
+  for (const name of await readdir(dir)) {
+    if (!name.endsWith(".sql")) continue;
+    out[`/migrations/${name}`] = await readFile(join(dir, name), "utf8");
+  }
+  return out;
+}
+
 async function createPgliteSql(): Promise<Sql> {
   // Embedded Postgres, imported on demand so it never loads on the Neon path.
-  // One in-memory instance per process, shared across HMR module instances, so
-  // data survives source edits (it resets on dev-server restart).
+  // One instance per process, shared across HMR module instances, so data
+  // survives source edits. In-memory under Vite; on disk under plain node or
+  // whenever ECHO_VAULT_DATA_DIR is set (see pgliteDataDir).
   globalRef.__pgliteInstance__ ??= (async () => {
     const { PGlite } = await import("@electric-sql/pglite");
-    const pg = new PGlite({
+    const dataDir = await pgliteDataDir();
+    if (dataDir) await lockDataDir(dataDir);
+    const options = {
       parsers: {
         [OID_INT8]: Number,
         [OID_DATE]: identity,
         [OID_INTERVAL]: identity,
       },
-    });
+    };
+    const pg = dataDir ? new PGlite(dataDir, options) : new PGlite(options);
     await pg.waitReady;
     await pg.exec(
       "create table if not exists _migrations (name text primary key, applied_at timestamptz not null default now())",
@@ -130,18 +245,12 @@ async function createPgliteSql(): Promise<Sql> {
   const pg = await globalRef.__pgliteInstance__;
 
   // Apply migrations/ (the single schema source) so preview matches production.
-  // SQL is inlined by the bundler via import.meta.glob (no runtime fs); applied
-  // files are tracked in _migrations. The glob does not descend, so the opt-in
-  // auth schema under migrations/auth/ stays out. Runs once per module instance
+  // Applied files are tracked in _migrations. Runs once per module instance
   // — so an HMR reload after adding a migration file applies it live — with
   // passes serialized on a global chain so concurrent callers never
   // double-apply.
   const migrate = async (): Promise<void> => {
-    const migrations = import.meta.glob("/migrations/*.sql", {
-      query: "?raw",
-      import: "default",
-      eager: true,
-    }) as Record<string, string>;
+    const migrations = await loadMigrations();
     const doneRows = await pg.query<{ name: string }>(
       "select name from _migrations",
     );
@@ -210,29 +319,52 @@ export async function getPglite(): Promise<import("@electric-sql/pglite").PGlite
 }
 
 /**
+ * Close the embedded PGLite (flushes its files). No-op on the Neon path or when
+ * nothing was opened. Call before a plain-node process exits.
+ */
+export async function closeDb(): Promise<void> {
+  const pending = globalRef.__pgliteInstance__;
+  if (!pending) return;
+  globalRef.__pgliteInstance__ = undefined;
+  globalRef.__pgliteMigrateChain__ = undefined;
+  sqlPromise = null;
+  try {
+    await (await pending).close();
+  } catch {
+    // already closed or never opened
+  }
+}
+
+/**
  * Finish DB bootstrap before the server handles traffic.
  *
- * - **PGLite** (preview / no `DATABASE_URL`): open the in-memory DB and apply
+ * - **PGLite** (preview / no `DATABASE_URL`): open the embedded DB and apply
  *   `migrations/*.sql`. Idempotent — concurrent callers share one promise.
  * - **Neon**: no-op (pool is created lazily on first query).
  *
  * Vite `configureServer` awaits this at dev startup; production imports of this
- * module kick it off immediately (see bottom of file).
+ * module under Vite kick it off immediately (see bottom of file).
  */
 export function ensureDbReady(): Promise<void> {
   if (dbSource !== "pglite") return Promise.resolve();
   return getSql().then(() => undefined);
 }
 
-// Server-only eager start: kick PGLite bootstrap as soon as this module loads in
-// Node. Client bundles never hit this path (`getSql` throws in the browser).
+// Server-only eager start: under Vite (dev server / built server bundle), kick
+// PGLite bootstrap as soon as this module loads. Client bundles never hit this
+// path (`getSql` throws in the browser). Under plain `node` nothing starts at
+// import time: the first `getSql()` opens the database, and its failure reaches
+// the caller that asked for it.
+//
+// The stored promise never rejects: a failed bootstrap is logged here and the
+// next `getSql()` retries and surfaces the error itself. Rethrowing from this
+// un-awaited promise would be an unhandled rejection, which kills the process.
 const globalBoot = globalThis as typeof globalThis & {
   __pgBootstrapPromise__?: Promise<void>;
 };
-if (typeof window === "undefined" && dbSource === "pglite") {
+if (typeof window === "undefined" && dbSource === "pglite" && underVite) {
   globalBoot.__pgBootstrapPromise__ ??= ensureDbReady().catch((err) => {
     globalBoot.__pgBootstrapPromise__ = undefined;
     console.error("[db] PGLite bootstrap failed:", err);
-    throw err;
   });
 }

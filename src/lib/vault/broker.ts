@@ -5,7 +5,6 @@ import {
   assertSafeDestination,
   buildProviderUrl,
   isAllowedMethod,
-  isApprovedCaller,
   PROVIDER_POLICIES,
 } from "./policy.ts";
 import { installProcessRedaction, redactValue, sanitizeError } from "./redaction.ts";
@@ -24,6 +23,11 @@ if (!process.env.NODE_TEST_CONTEXT) {
 }
 
 export interface BrokerContext {
+  /**
+   * Label for the v1 in-memory audit trail: the authenticated client_id. It is
+   * NOT an authorization input — authentication and policy happen in
+   * v2/gateway.ts (dispatchTool) before anything here runs.
+   */
   caller: string;
   store?: CredentialStore;
 }
@@ -73,21 +77,6 @@ export async function useCredential(
 ): Promise<ToolResult> {
   const started = Date.now();
   const caller = ctx.caller || "unknown";
-  if (!isApprovedCaller(caller)) {
-    recordAudit({
-      caller,
-      credential_ref: input.credential_ref,
-      provider: input.provider,
-      operation: String(input.operation),
-      resource: input.resource,
-      http_status: null,
-      duration_ms: Date.now() - started,
-      result: "denied",
-      error: "caller_not_allowed",
-    });
-    return fail("caller_not_allowed", input.credential_ref);
-  }
-
   if (!ctx.store) {
     await ensureImported();
   }

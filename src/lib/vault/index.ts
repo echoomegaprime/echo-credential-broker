@@ -5,7 +5,8 @@ export type {
   ProviderId,
   AuditRecord,
 } from "./types.ts";
-export { callTool, listTools, vaultList, vaultStatus, credentialHealth } from "./tools.ts";
+export { vaultList, vaultStatus, credentialHealth } from "./tools.ts";
+export { dispatchTool, listTools } from "./v2/gateway.ts";
 export { handleMcpRequest } from "./mcp.ts";
 export { getStore } from "./store.ts";
 export { ensureImported } from "./importer.ts";

@@ -12,10 +12,10 @@ This repo is the shared source for Echo Vault. Chat clients are interchangeable.
 
 ## Runtime MCP (use credentials, never read them)
 
-| Client | Transport | Caller header / env |
+| Client | Transport | How it is identified |
 | --- | --- | --- |
-| Grok | HTTP `/api/mcp` or stdio | `x-echo-agent: grok` / `ECHO_AGENT=grok` |
-| GPT | Custom GPT Action + MCP | `x-echo-agent: chatgpt` |
-| Claude Desktop / Code | stdio `npm run mcp` | `ECHO_AGENT=claude` |
+| Grok, ChatGPT, Claude.ai (remote) | HTTP `/api/mcp` | OAuth 2.1 access token; you approve the client on Telegram |
+| Claude Desktop / Code, Codex CLI (local) | stdio `npm run mcp` | The local OS process; `ECHO_AGENT` only names it in the ledger |
+| Server-side services | HTTP `/api/rest/tool` or `/api/mcp` | Workload token listed (hashed) in `ECHO_VAULT_WORKLOAD_TOKENS_FILE` |
 
 Install walkthrough: [INSTALL.md](./INSTALL.md)

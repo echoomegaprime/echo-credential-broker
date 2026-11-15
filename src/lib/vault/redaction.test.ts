@@ -57,3 +57,27 @@ describe("redaction", () => {
     assert.equal(json.includes(OPENAI), false);
   });
 });
+
+describe("redactValue works leaf by leaf", () => {
+  it("a greedy rule inside one string cannot destroy the surrounding JSON", () => {
+    const value = {
+      tools: [{ name: "entry_use", description: "Sends Authorization: Bearer <secret> to the site" }, { name: "vault_list", description: "List refs" }],
+      note: "Cookie: a=b; c=d",
+    };
+    const out = redactValue(value);
+    assert.equal(out.tools.length, 2);
+    assert.equal(out.tools[1].name, "vault_list");
+    assert.match(out.tools[0].description, /\[REDACTED\]/);
+    assert.deepEqual(JSON.parse(safeJson(value)).tools.map((t: { name: string }) => t.name), ["entry_use", "vault_list"]);
+  });
+
+  it("still blanks sensitive keys, redacts keys and values, and fails closed on non-JSON data", () => {
+    const pat = "ghp_TESTONLYREDACTLEAF000000000000000001";
+    const out = redactValue({ token: "anything", nested: { [`k_${pat}`]: `v ${pat}` }, list: [pat] });
+    assert.equal(JSON.stringify(out).includes(pat), false);
+    assert.equal(out.token, "[REDACTED_SECRET]");
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    assert.deepEqual(redactValue(cyclic), { error: "unserializable_redacted" });
+  });
+});

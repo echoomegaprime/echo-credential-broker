@@ -14,7 +14,9 @@
     "preview": "node scripts/with-app-env.mjs vite preview",
     "typecheck": "tsc --noEmit",
     "check:auth": "node scripts/check-auth-invariant.mjs",
-    "test": "node --test 'scripts/**/*.test.mjs' && node --experimental-strip-types --test src/lib/app-data/app-data.test.ts src/lib/auth/gate-identity.test.ts src/lib/vault/*.test.ts",
+    "test:vault": "node --experimental-strip-types --test src/lib/app-data/app-data.test.ts src/lib/auth/gate-identity.test.ts src/lib/vault/*.test.ts src/lib/vault/v2/*.test.ts",
+    "test:scripts": "node --test 'scripts/**/*.test.mjs'",
+    "test": "npm run test:vault && npm run test:scripts",
     "mcp": "node --experimental-strip-types scripts/mcp-stdio.ts",
     "lint": "eslint .",
     "format": "prettier --write ."
