@@ -6,7 +6,7 @@
  *   dispatchTool(identity, name, args)
  *     1. tool name → { capability, resource, params } (a "plan"; no side effects
  *        beyond metadata lookups)
- *     2. evaluatePolicy(request)
+ *     2. evaluatePolicy(request), then the awaited enforceRateLimits(…)
  *     3. deny      → ledger(denied), { ok:false, error:<reason> }
  *        escalate  → with args.approval_id: consumeApproval(id, request) must be
  *                    "ok" (single use, same client, same params, unexpired);
@@ -119,6 +119,7 @@ import { purgeEntry, rotateEntry, setEntryRotation, type RotationDeps } from "./
 import { pinnedFetch, type PinnedFetch } from "./pinned-fetch.ts";
 import { anchorHead, newestAnchorVerdict, verifyAnchorLine, type AnchorDeps } from "./ledger-anchor.ts";
 import {
+  enforceRateLimits,
   evaluatePolicy,
   lookupCapability,
   requiredScope,
@@ -1892,7 +1893,10 @@ export async function dispatchTool(
       resource: plan.resource,
       params: plan.params,
     };
-    let decision = evaluatePolicy(request, deps.rules, deps.policy);
+    let decision = evaluatePolicy(request, deps.rules);
+    // max_per_hour (shared store, awaited). Denies "rate_limited", or
+    // "rate_limit_unavailable" when the store is unreachable (fail closed).
+    decision = await enforceRateLimits(request, decision, deps.rules, deps.policy);
     // Owner-only admin surface: vault.admin.* is tier 3, so evaluatePolicy denies
     // it for EVERY client. The one exception is the local stdio identity — the
     // owner on their own machine — which we allow here. This carve-out is keyed
