@@ -44,7 +44,7 @@ Work top to bottom. Nothing here needs a secret pasted into a chat.
 - [ ] Optional: `ECHO_VAULT_DIGEST_DENIAL_BURST` (default 10).
 - [ ] Optional: `ECHO_VAULT_POLICY_FILE`, `ECHO_VAULT_WORKLOAD_TOKENS_FILE`, the `ECHO_VAULT_GITHUB_*` variables. See `.env.example`.
 - [ ] Optional consent-grant tuning: `ECHO_VAULT_GRANT_TTL_MS` (grant lifetime, default `86400000` = 24 h) and `ECHO_VAULT_GRANT_MAX_USES` (un-prompted reads per grant, default `500`; `unlimited` for no cap).
-- [ ] Deploy (`npm run build`, then start the server the way your host does).
+- [ ] Deploy (`npm run build`, then start the server the way your host does). On your own Node box: [ops/self-host.md](./ops/self-host.md).
 
 ## 4. Point Telegram at the server
 
