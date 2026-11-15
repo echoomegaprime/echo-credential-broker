@@ -7,6 +7,24 @@ import type { ToolResult } from "./types.ts";
 
 const GITHUB_REF = "vault://github/echoomegaprime";
 
+/**
+ * Check a `{status, body}` answer from useCredential before a typed tool reads
+ * it. Returns what to hand back instead, or null when the body is usable:
+ *   - a failure, or a 4xx/5xx answer: returned unchanged (v2/gateway.ts turns
+ *     the status into a tool error; it must never be reshaped into empty data);
+ *   - a 2xx answer whose body is not a JSON object/array: provider_malformed_response.
+ */
+function unreadable(res: ToolResult, credential_ref: string): ToolResult | null {
+  if (!res.ok) return res;
+  const data = res.data as { status?: unknown; body?: unknown } | null;
+  const status = typeof data?.status === "number" ? data.status : 0;
+  if (status >= 400) return res;
+  if (data?.body === null || typeof data?.body !== "object") {
+    return { ok: false, error: "provider_malformed_response", credential_ref, detail: `http_${status}: the response body was not JSON` };
+  }
+  return null;
+}
+
 async function githubSecret(ctx: BrokerContext, ref: string): Promise<ToolResult<string>> {
   const store = ctx.store ?? getStore();
   const secret = await store.resolveSecret(ref);
@@ -69,6 +87,8 @@ export async function githubGetRepository(
     operation: "GET",
     resource: `/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}`,
   }).then((res) => {
+    const bad = unreadable(res, ref);
+    if (bad) return bad;
     if (!res.ok) return res;
     const body = res.data as { body?: Record<string, unknown>; status?: number };
     const repo = (body.body ?? body) as Record<string, unknown>;
@@ -107,6 +127,8 @@ export async function githubGetFile(
     operation: "GET",
     resource: `/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/contents/${path}${qs}`,
   }).then((res) => {
+    const bad = unreadable(res, ref);
+    if (bad) return bad;
     if (!res.ok) return res;
     const body = (res.data as { body?: Record<string, unknown> }).body ?? {};
     return redactValue({
@@ -137,6 +159,8 @@ export async function githubListRepositories(
     operation: "GET",
     resource: `/user/repos?per_page=${perPage}&sort=updated`,
   }).then((res) => {
+    const bad = unreadable(res, ref);
+    if (bad) return bad;
     if (!res.ok) return res;
     const body = (res.data as { body?: unknown }).body;
     const repos = Array.isArray(body) ? body : [];
@@ -213,46 +237,50 @@ export async function cloudflareZoneGet(
   ctx: BrokerContext,
   input: { credential_ref?: string; zone_id: string },
 ): Promise<ToolResult> {
+  const ref = input.credential_ref ?? "vault://cloudflare/global_api_key";
   return useCredential(ctx, {
-    credential_ref: input.credential_ref ?? "vault://cloudflare/global_api_key",
+    credential_ref: ref,
     provider: "cloudflare",
     operation: "GET",
     resource: `/client/v4/zones/${encodeURIComponent(input.zone_id)}`,
-  });
+  }).then((res) => unreadable(res, ref) ?? res);
 }
 
 export async function openaiAccountStatus(
   ctx: BrokerContext,
   input: { credential_ref?: string } = {},
 ): Promise<ToolResult> {
+  const ref = input.credential_ref ?? "vault://openai/api_key";
   return useCredential(ctx, {
-    credential_ref: input.credential_ref ?? "vault://openai/api_key",
+    credential_ref: ref,
     provider: "openai",
     operation: "GET",
     resource: "/v1/models",
-  });
+  }).then((res) => unreadable(res, ref) ?? res);
 }
 
 export async function stripeBalance(
   ctx: BrokerContext,
   input: { credential_ref?: string } = {},
 ): Promise<ToolResult> {
+  const ref = input.credential_ref ?? "vault://stripe/secret_key";
   return useCredential(ctx, {
-    credential_ref: input.credential_ref ?? "vault://stripe/secret_key",
+    credential_ref: ref,
     provider: "stripe",
     operation: "GET",
     resource: "/v1/balance",
-  });
+  }).then((res) => unreadable(res, ref) ?? res);
 }
 
 export async function xaiAccountStatus(
   ctx: BrokerContext,
   input: { credential_ref?: string } = {},
 ): Promise<ToolResult> {
+  const ref = input.credential_ref ?? "vault://xai/api_key";
   return useCredential(ctx, {
-    credential_ref: input.credential_ref ?? "vault://xai/api_key",
+    credential_ref: ref,
     provider: "xai",
     operation: "GET",
     resource: "/v1/models",
-  });
+  }).then((res) => unreadable(res, ref) ?? res);
 }

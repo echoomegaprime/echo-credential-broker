@@ -743,6 +743,24 @@ function githubRepoResource(a: Record<string, unknown>): { owner: string; repo: 
   return { owner, repo, resource: `github:${owner}/${repo}` };
 }
 
+/** A provider's 4xx/5xx answer as a tool failure: a stable code, the status and the (redacted) error body. */
+function providerHttpFailure(status: number, body: unknown, credentialRef?: string): GatewayResult {
+  const error =
+    status === 401
+      ? "provider_rejected_credential"
+      : status === 403
+        ? "provider_forbidden"
+        : status === 429
+          ? "provider_rate_limited"
+          : status >= 500
+            ? "provider_unavailable"
+            : "provider_http_error";
+  const out: GatewayResult = { ok: false, error, detail: `The provider answered ${status}.`, status };
+  if (body !== undefined && body !== null && body !== "") out.body = typeof body === "string" ? clip(body, 2000) : body;
+  if (credentialRef) out.credential_ref = credentialRef;
+  return out;
+}
+
 /** Outcome of a v1 executor ({ok, data|error, credential_ref?, detail?}). */
 function fromV1(result: unknown, credentialRef?: string): Outcome {
   const r = (isRecord(result) ? result : { ok: false, error: "internal_error" }) as Record<string, unknown>;
@@ -751,6 +769,11 @@ function fromV1(result: unknown, credentialRef?: string): Outcome {
   if (r.ok === true) {
     const status = isRecord(r.data) && typeof r.data.status === "number" ? r.data.status : undefined;
     if (status !== undefined && status >= 100 && status <= 599) audit.http_status = status;
+    // The provider refused or failed (4xx/5xx): that is a failure for the caller
+    // too, not only in the ledger. Before this, the caller got `ok: true`.
+    if (audit.http_status !== undefined && audit.http_status >= 400) {
+      return { result: providerHttpFailure(audit.http_status, (r.data as Record<string, unknown>).body, credentialRef), audit };
+    }
     return { result: { ok: true, data: r.data }, audit };
   }
   const out: GatewayResult = { ok: false, error: typeof r.error === "string" ? r.error : "internal_error" };
