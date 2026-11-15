@@ -56,7 +56,7 @@ Where the "before" tests live: `src/lib/vault/v2/gateway.test.ts` and
 `src/lib/vault/acceptance.test.ts` (the only live block before this change:
 `credential_health` and `github_get_repository`).
 
-Totals: offline "yes" went from 19 of 33 to 33 of 33. Live went from 2 tools to 8.
+Totals: offline "yes" went from 20 of 34 to 34 of 34. Live went from 2 tools to 8.
 
 ## New test files
 
