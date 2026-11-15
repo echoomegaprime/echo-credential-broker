@@ -766,6 +766,9 @@ export const CONSOLE_TOOLS: ReadonlySet<string> = new Set([
   "admin_delete_entry",
   "admin_request_reentry",
   "admin_digest_now",
+  "admin_enroll_injector",
+  "admin_list_injectors",
+  "admin_revoke_injector",
 ]);
 
 /** Destructive calls: a WebAuthn assertion for this session in the last STEP_UP_MS is required. */
@@ -776,6 +779,7 @@ export function toolNeedsStepUp(tool: string, args: Record<string, unknown>): bo
     case "admin_revoke_client":
     case "admin_set_client_scopes":
     case "admin_rotate_entry":
+    case "admin_enroll_injector": // creates a party that can receive credentials (sealed, after an approval)
       return true;
     case "admin_set_rotation":
       // Only an explicit "manual" is exempt; a malformed mode is treated as destructive.

@@ -158,6 +158,9 @@ export const CAPABILITY_REGISTRY: Readonly<Record<string, Readonly<CapabilitySpe
   // generic proxy: the broker cannot tell what it does, so a human decides.
   // (Stripe writes are not here: they map to "payment.stripe.write", tier 3.)
   "vault.entry.use.write": { tier: 2, access: "write" },
+  // Hand a stored credential to the owner's own browser, sealed to an enrolled
+  // injector (injector.ts). Tier 2 with no grant path: approved per request, every time.
+  "vault.entry.inject": { tier: 2, access: "write" },
   "github.api.write": { tier: 2, access: "write" },
   "cloudflare.api.write": { tier: 2, access: "write" },
   "openai.api.write": { tier: 2, access: "write" },

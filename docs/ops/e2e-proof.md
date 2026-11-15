@@ -133,6 +133,12 @@ Your own decisions:
 ```bash
 npm run e2e:rehearsal          # under a minute; exit 0 only when every row passes
 node scripts/e2e/rehearsal.mjs --keep   # keep the temp dir: transcript.json, data/, server.log
+npm run e2e:rehearsal:cookie   # the same proof with a `cookie` entry
+npm run e2e:rehearsal:inject   # the cookie proof plus the browser injector channel (ops/injector-channel.md):
+                               # a SCRIPTED injector (a P-256 key pair made by the script — no extension, no browser)
+                               # is enrolled over local stdio, the client calls entry_inject, the owner stand-in
+                               # approves that one request, the script redeems the ticket over HTTP, opens the sealed
+                               # blob and compares the cookie with what the owner typed on the card
 ```
 
 It starts the real server with `npm run dev` on a free loopback port, with PGlite in a temp directory and every variable from `docs/DEPLOY.md` §1–3 set to a value generated in memory. Nothing under `src/` is changed or switched into a test mode. Three things stand in for the outside world:

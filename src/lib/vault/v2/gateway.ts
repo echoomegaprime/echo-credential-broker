@@ -132,6 +132,22 @@ import {
   type CookieJar,
   type CookieJarSummary,
 } from "./cookie-jar.ts";
+import {
+  checkTargetOrigin,
+  enrollInjector,
+  INJECT_CAPABILITY,
+  INJECT_MODES,
+  InjectorError,
+  injectResource,
+  kindForMode,
+  listInjectors,
+  mintTicket,
+  resolveInjector,
+  revokeInjector,
+  type InjectMode,
+  type InjectorDeps,
+  type InjectorView,
+} from "./injector.ts";
 import { pinnedFetch, type PinnedFetch } from "./pinned-fetch.ts";
 import { anchorHead, newestAnchorVerdict, verifyAnchorLine, type AnchorDeps } from "./ledger-anchor.ts";
 import {
@@ -194,6 +210,8 @@ export interface GatewayDeps {
   digest?: DigestDeps;
   /** admin_console_bootstrap wiring (console store, clock). */
   console?: BootstrapDeps;
+  /** entry_inject / admin_*_injector wiring (injector registry, ticket store). */
+  injector?: InjectorDeps;
 }
 
 /** Consent-grant TTL and use cap from the environment (change #1). */
@@ -463,6 +481,22 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = Object.freeze([
     ),
   },
   {
+    name: "entry_inject",
+    description:
+      "Ask for a stored credential to be placed into the OWNER'S OWN BROWSER by an enrolled injector (the owner's browser extension) — you never see it. mode \"cookies\" sets the session cookies of a cookie entry for target_origin; mode \"field\" types the password of a password entry into the field the owner's page shows. target_origin must be https://<host> where host is the entry's site or a subdomain of it. Tier 2, scope vault.write: EVERY call needs the owner's Telegram approval of that exact request (there is no standing grant). The first call returns `approval_required`; call again with the same arguments plus approval_id to get a single-use ticket (120 s) that only the bound injector can redeem. The result is the ticket and metadata, never a secret.",
+    inputSchema: schema(
+      {
+        site: { type: "string", description: "Domain of the entry, e.g. github.com." },
+        account: { type: "string", description: "Which account on that site. Default: the site's default entry of the kind the mode needs." },
+        target_origin: { type: "string", description: "https://<host>: the entry's site or a subdomain of it. Lower case, no port, path or query." },
+        mode: { type: "string", enum: INJECT_MODES, description: "cookies: a cookie entry. field: a password entry." },
+        injector_id: { type: "string", description: "Which enrolled injector. May be omitted when exactly one is enrolled." },
+        task: { type: "string", description: "What you are doing and why. Required; shown to the owner and recorded in the audit ledger.", maxLength: 300 },
+      },
+      ["site", "target_origin", "mode", "task"],
+    ),
+  },
+  {
     name: "approval_status",
     description: "Status of an approval you were asked to wait for: pending, approved, denied, expired or consumed. Tier 0, scope vault.read.",
     inputSchema: {
@@ -608,6 +642,30 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = Object.freeze([
       { entry_id: { type: "string" }, reason: { type: "string", maxLength: 300, description: "Shown on the card. Default: requested from the owner console." } },
       ["entry_id"],
     ),
+  },
+  {
+    name: "admin_enroll_injector",
+    description:
+      "OWNER ONLY (local stdio or the passkey console, with a fresh passkey confirmation there): enroll a browser injector. public_key_jwk is the P-256 ECDH PUBLIC key the extension shows (kty EC, crv P-256, x, y); a private key is refused. Returns the injector id and its injector_token ONCE (stored only as a hash); paste both into the extension. Any remote caller is refused (tier 3).",
+    inputSchema: schema(
+      {
+        name: { type: "string", description: "A name for this browser, e.g. \"desktop chrome\".", maxLength: 64 },
+        public_key_jwk: { description: "The public JWK as an object (or its JSON text)." },
+      },
+      ["name", "public_key_jwk"],
+    ),
+  },
+  {
+    name: "admin_list_injectors",
+    description:
+      "OWNER ONLY (local stdio or the passkey console): list enrolled browser injectors (id, name, public key thumbprint, status, times). Never a token. Any remote caller is refused (tier 3).",
+    inputSchema: schema({}),
+  },
+  {
+    name: "admin_revoke_injector",
+    description:
+      "OWNER ONLY (local stdio or the passkey console): revoke a browser injector. Its token stops working at once and its outstanding tickets can no longer be redeemed. Any remote caller is refused (tier 3).",
+    inputSchema: schema({ injector_id: { type: "string" } }, ["injector_id"]),
   },
   {
     name: "admin_console_bootstrap",
@@ -1098,6 +1156,148 @@ async function siteRequest(
   if (location) out.location = clip(redactString(location), 500);
   if (truncated) out.truncated = true;
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// Browser injector channel (entry_inject, admin_*_injector) — injector.ts
+// ---------------------------------------------------------------------------
+
+function injectorDeps(env: Env): InjectorDeps {
+  const d = env.deps.injector ?? {};
+  return { ...d, now: d.now ?? env.deps.now, cards: d.cards ?? env.deps.cards, ledger: d.ledger ?? env.deps.ledger };
+}
+
+const INJECTOR_ERROR_DETAIL: Readonly<Record<string, string>> = {
+  invalid_target_origin: "target_origin must be exactly https://<host>: lower case, no port, path, query or credentials",
+  target_origin_not_allowed: "target_origin must be the entry's own site or a subdomain of it",
+  mode_kind_mismatch: "mode \"cookies\" needs a cookie entry and mode \"field\" needs a password entry",
+  entry_not_active: "this entry needs its secret re-entered (or was deleted) before it can be injected",
+  injector_not_found: "no active injector with that id",
+  no_injector_enrolled: "the owner has not enrolled a browser injector",
+  injector_required: "several injectors are enrolled; pass injector_id",
+  invalid_public_key: "public_key_jwk must be a P-256 ECDH public JWK (kty EC, crv P-256, x, y)",
+  private_key_not_allowed: "that JWK contains a private key; send only the public key",
+  invalid_name: "name: 1 to 64 characters",
+  too_many_injectors: "too many active injectors; revoke one first",
+  key_already_enrolled: "an active injector already uses this public key",
+};
+
+function injectorInputError(err: unknown): never {
+  if (err instanceof InjectorError) throw new ToolInputError(err.code, INJECTOR_ERROR_DETAIL[err.code] ?? err.code);
+  throw err;
+}
+
+/**
+ * `entry_inject`: tier 2 (`vault.entry.inject`), so EVERY call is escalated and
+ * needs a request-bound, single-use approval; no consent grant is involved.
+ * Everything that can be refused without the owner is refused here, before an
+ * approval is requested: the origin, the mode/kind pairing, the entry's state,
+ * the injector. The run mints the ticket and writes its own ok row — no ticket
+ * without that row (injector.ts mintTicket).
+ */
+async function entryInjectPlan(a: Record<string, unknown>, env: Env): Promise<Plan> {
+  const capability = INJECT_CAPABILITY;
+  const task = sanitizeDisplayText(reqStr(a, "task"), 300);
+  if (!task) throw new ToolInputError("invalid_task", "task: describe what you are doing and why");
+  const mode = reqStr(a, "mode") as InjectMode;
+  if (!INJECT_MODES.includes(mode)) throw new ToolInputError("invalid_arguments", `mode: must be one of ${INJECT_MODES.join(", ")}`);
+  const targetOrigin = reqStr(a, "target_origin");
+  const siteArg = reqStr(a, "site");
+  const accountArg = optStr(a, "account");
+  const injectorArg = optStr(a, "injector_id");
+
+  // Without the scope the policy engine denies; do not resolve (or confirm the existence of) anything first.
+  const scope = requiredScope(capability);
+  if (!scope || !env.identity.scopes.includes(scope)) {
+    return {
+      capability,
+      resource: clip(`entry:${sanitizeDisplayText(siteArg, 253) || "?"}/${accountArg ? sanitizeDisplayText(accountArg, 200) : "default"}`, MAX_RESOURCE),
+      params: { mode, task },
+      summary: "",
+      task,
+      run: async () => ({ result: { ok: false, error: "missing_scope" } }),
+    };
+  }
+
+  const wanted = kindForMode(mode);
+  let entry: EntryMetadata;
+  try {
+    entry = await resolveEntry({ site: siteArg, account: accountArg, kind: wanted }, env.deps.cards);
+  } catch (err) {
+    if (!(err instanceof EntryError)) throw err;
+    if (err.code === "entry_not_found") {
+      // Is there an entry of ANOTHER kind for this site/account? Then the mode is what is wrong.
+      const other = await resolveEntry({ site: siteArg, account: accountArg }, env.deps.cards).then(
+        () => true,
+        (e) => e instanceof EntryError && e.code === "ambiguous_entry",
+      );
+      if (other) throw new ToolInputError("mode_kind_mismatch", INJECTOR_ERROR_DETAIL.mode_kind_mismatch);
+    }
+    throw new ToolInputError(err.code, err.message);
+  }
+  if (entry.kind !== wanted) throw new ToolInputError("mode_kind_mismatch", INJECTOR_ERROR_DETAIL.mode_kind_mismatch);
+  let injector: InjectorView;
+  try {
+    checkTargetOrigin(targetOrigin, entry.site);
+    if (entry.status !== "active") throw new InjectorError("entry_not_active");
+    injector = await resolveInjector(injectorArg, injectorDeps(env));
+  } catch (err) {
+    injectorInputError(err);
+  }
+
+  const resource = clip(injectResource(entry.site, entry.account, injector.injector_id), MAX_RESOURCE);
+  const what = mode === "cookies" ? "the session cookies" : "the password";
+  return {
+    capability,
+    resource,
+    // Digested for the approval: this entry, this mode, this origin, this injector, this task.
+    params: { entry_id: entry.id, mode, target_origin: targetOrigin, injector_id: injector.injector_id, task },
+    summary: `Put ${what} of "${entry.label}" into YOUR browser at ${targetOrigin} through injector "${sanitizeDisplayText(injector.name, 64)}" (${injector.injector_id}). Single use, 120 s. Task: ${task}`,
+    task,
+    run: async (ctx) => {
+      // Tier 2 always escalates; this guard makes "no approval, no ticket" local to the mint as well.
+      if (!ctx.approved || !ctx.approvalId) return { result: { ok: false, error: "approval_required" } };
+      const ledger = env.deps.ledger ?? appendLedger;
+      try {
+        // Metadata may have changed while the owner decided.
+        const current = await getEntryMetadata(entry.id, env.deps.cards);
+        if (!current || current.status !== "active") throw new InjectorError("entry_not_active");
+        const minted = await mintTicket(
+          {
+            client_id: env.identity.client_id,
+            entry: current,
+            mode,
+            target_origin: targetOrigin,
+            injector_id: injector.injector_id,
+            approval_id: ctx.approvalId,
+            record: () =>
+              ledger({
+                client_id: env.identity.client_id,
+                capability,
+                resource,
+                decision: "escalate",
+                tier: ctx.decision.tier,
+                result: "ok",
+                approval_id: ctx.approvalId,
+                credential_ref: current.ref,
+                task,
+              }),
+          },
+          injectorDeps(env),
+        );
+        return { ledgered: true, audit: { credential_ref: current.ref }, result: { ok: true, data: minted } };
+      } catch (err) {
+        const code = err instanceof InjectorError ? err.code : "internal_error";
+        if (code === "ledger_unavailable") {
+          return {
+            ledgered: true, // the row could not be written; a second attempt by the gateway would not change that
+            result: { ok: false, error: "ledger_unavailable", action_performed: false, detail: "Refused: the ticket could not be recorded in the audit ledger, so none was issued." },
+          };
+        }
+        return { audit: { credential_ref: entry.ref }, result: { ok: false, error: code, detail: INJECTOR_ERROR_DETAIL[code] } };
+      }
+    },
+  };
 }
 
 async function entryUsePlan(a: Record<string, unknown>, env: Env): Promise<Plan> {
@@ -1934,6 +2134,68 @@ const PLANNERS: Readonly<Record<string, Planner>> = Object.freeze({
           return { result: { ok: true, data: receipt } };
         } catch (err) {
           return { result: entryFailure(err) };
+        }
+      },
+    };
+  },
+  entry_inject: (a, env) => entryInjectPlan(a, env),
+  // Browser injectors (injector.ts). The enroll result carries the injector token ONCE, under a key
+  // the result redaction does not blank ("injector_token"); it is never ledgered or logged.
+  admin_enroll_injector: (a, env) => {
+    const name = reqStr(a, "name");
+    const jwk = a.public_key_jwk;
+    if ((typeof jwk !== "string" && !isRecord(jwk)) || jwk === "") throw new ToolInputError("invalid_public_key", INJECTOR_ERROR_DETAIL.invalid_public_key);
+    return {
+      capability: "vault.admin.injector.enroll",
+      resource: "vault:injectors",
+      params: {},
+      summary: "Enroll a browser injector",
+      run: async () => {
+        try {
+          const { injector, token } = await enrollInjector({ name, public_key_jwk: jwk }, injectorDeps(env));
+          return {
+            result: {
+              ok: true,
+              data: {
+                ...injector,
+                injector_token: token,
+                next: "Paste injector_id and injector_token into the extension now. The token is shown once and stored only as a hash; to replace it, revoke this injector and enroll again.",
+              },
+            },
+          };
+        } catch (err) {
+          const code = err instanceof InjectorError ? err.code : "internal_error";
+          return { result: { ok: false, error: code, detail: INJECTOR_ERROR_DETAIL[code] } };
+        }
+      },
+    };
+  },
+  admin_list_injectors: (_a, env) => ({
+    capability: "vault.admin.injector.list",
+    resource: "vault:injectors",
+    params: {},
+    summary: "List browser injectors",
+    run: async () => {
+      try {
+        return { result: { ok: true, data: { injectors: await listInjectors(injectorDeps(env)) } } };
+      } catch {
+        return { result: { ok: false, error: "internal_error" } };
+      }
+    },
+  }),
+  admin_revoke_injector: (a, env) => {
+    const id = reqStr(a, "injector_id");
+    return {
+      capability: "vault.admin.injector.revoke",
+      resource: clip(`vault:injector/${sanitizeDisplayText(id, 40)}`, MAX_RESOURCE),
+      params: { injector_id: id },
+      summary: `Revoke browser injector ${clip(sanitizeDisplayText(id, 40), 40)}`,
+      run: async () => {
+        try {
+          return { result: { ok: true, data: { injector_id: id, revoked: await revokeInjector(id, injectorDeps(env)) } } };
+        } catch (err) {
+          const code = err instanceof InjectorError ? err.code : "internal_error";
+          return { result: { ok: false, error: code, detail: INJECTOR_ERROR_DETAIL[code] } };
         }
       },
     };

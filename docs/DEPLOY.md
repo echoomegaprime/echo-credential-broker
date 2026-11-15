@@ -20,6 +20,8 @@ Work top to bottom. Nothing here needs a secret pasted into a chat.
   | 0009 | Digest sent-window state ([ops/daily-digest.md](./ops/daily-digest.md)) |
   | 0010 | Shared rate-limit state ([ops/rate-limits.md](./ops/rate-limits.md)) |
   | 0011 | Owner console: passkeys, challenges, sessions, bootstrap code ([ops/owner-console.md](./ops/owner-console.md)) |
+  | 0012 | `cookie` entries: kind, jar metadata, length limit ([ops/cookie-entries.md](./ops/cookie-entries.md)) |
+  | 0013 | Browser injector channel: injectors (public key, token hash) and inject tickets (hashes only) ([ops/injector-channel.md](./ops/injector-channel.md)) |
 
 ## 2. Telegram bot
 
