@@ -17,6 +17,11 @@
  *
  *   node scripts/e2e/rehearsal.mjs            # exit 0 only when every row passes
  *   node scripts/e2e/rehearsal.mjs --keep     # keep the temp dir (server log, transcript)
+ *   node scripts/e2e/rehearsal.mjs --cookie   # the same proof with a `cookie` entry (docs/ops/cookie-entries.md):
+ *                                             # the owner pastes a Cookie header on the card page, entry_use sends it
+ *                                             # to https://httpbin.org/cookies, which echoes the cookies it received —
+ *                                             # the client must see them REDACTED. Same fail-closed rule when the
+ *                                             # site is unreachable.
  */
 import { spawn } from "node:child_process";
 import { createHash, randomBytes, randomInt } from "node:crypto";
@@ -29,21 +34,32 @@ import { parseArgs } from "node:util";
 import { startFakeGate } from "./fake-gate.mjs";
 import { approvalButtons, cardLink, startFakeTelegram } from "./fake-telegram.mjs";
 
+const { values: flags } = parseArgs({
+  options: {
+    keep: { type: "boolean", default: false },
+    verbose: { type: "boolean", default: false },
+    cookie: { type: "boolean", default: false },
+    help: { type: "boolean", default: false },
+  },
+});
+if (flags.help) {
+  process.stdout.write("usage: node scripts/e2e/rehearsal.mjs [--cookie] [--keep] [--verbose]\n");
+  process.exit(0);
+}
+
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, "..", "..");
 const SITE = "httpbin.org";
-const SITE_PATH = "/bearer";
+/** --cookie: a `cookie` entry against /cookies (echoes received cookies). Default: an api_key entry against /bearer. */
+const COOKIE_MODE = flags.cookie;
+const KIND = COOKIE_MODE ? "cookie" : "api_key";
+const SITE_PATH = COOKIE_MODE ? "/cookies" : "/bearer";
+const COOKIE_NAME = "rehearsal_session";
+/** What the site answers to a request that carries no credential: /bearer refuses, /cookies shows an empty jar. */
+const STATUS_WITHOUT_CREDENTIAL = COOKIE_MODE ? 200 : 401;
 const ACCOUNT = "e2e-rehearsal";
 const READY_TIMEOUT_MS = 120_000;
 const CLIENT_TIMEOUT_MS = 240_000;
-
-const { values: flags } = parseArgs({
-  options: { keep: { type: "boolean", default: false }, verbose: { type: "boolean", default: false }, help: { type: "boolean", default: false } },
-});
-if (flags.help) {
-  process.stdout.write("usage: node scripts/e2e/rehearsal.mjs [--keep] [--verbose]\n");
-  process.exit(0);
-}
 
 const out = (line = "") => process.stdout.write(`${line}\n`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -73,7 +89,16 @@ const secrets = {
   anchorKey: b64url(36),
 };
 const APPROVER_ID = 700_000_000 + randomInt(1, 9_999_999);
-const credentialFingerprint = createHash("sha256").update(secrets.credential, "utf8").digest("hex").slice(0, 8);
+/** What the owner types on the card page. --cookie: a Cookie header whose one value is the throwaway credential. */
+const typedSecret = COOKIE_MODE ? `${COOKIE_NAME}=${secrets.credential}` : secrets.credential;
+/**
+ * What the vault must hold under the entry key. For a cookie entry that is the canonical jar JSON
+ * (docs/ops/cookie-entries.md), written out here independently of src/ so the fingerprint check means something.
+ */
+const storedSecret = COOKIE_MODE
+  ? `{"v":1,"cookies":[{"name":${JSON.stringify(COOKIE_NAME)},"value":${JSON.stringify(secrets.credential)},"domain":"","path":"/","secure":false,"httpOnly":false,"hostOnly":true,"expires":null}]}`
+  : secrets.credential;
+const credentialFingerprint = createHash("sha256").update(storedSecret, "utf8").digest("hex").slice(0, 8);
 
 /** Every encoding of a value that a leak could take. */
 function encodings(value) {
@@ -208,6 +233,7 @@ function baseEnv() {
 
 async function main() {
   out("ECHO Vault v2 rehearsal — real server, fake canonical vault, fake Telegram, scripted owner");
+  out(COOKIE_MODE ? `mode: cookie entry (--cookie) — the owner pastes a Cookie header; target GET https://${SITE}${SITE_PATH}` : `mode: api_key entry — target GET https://${SITE}${SITE_PATH}`);
   out("");
 
   const tmp = mkdtempSync(join(tmpdir(), "echo-vault-rehearsal-"));
@@ -363,8 +389,9 @@ async function main() {
         const value = /\bvalue="([^"]*)"/.exec(m[0])?.[1] ?? "";
         form.set(name, value.replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">"));
       }
-      const hasSecretField = form.has("secret");
-      form.set("secret", secrets.credential); // the owner types it
+      // A cookie card's secret field is a textarea (always empty); every other kind has an <input name="secret">.
+      const hasSecretField = COOKIE_MODE ? /<textarea\b[^>]*\bname="secret"[^>]*><\/textarea>/.test(html) : form.has("secret");
+      form.set("secret", typedSecret); // the owner types (or pastes) it
       owner.cardPostBody = form.toString();
       const post = await fetch(link, {
         method: "POST",
@@ -383,7 +410,7 @@ async function main() {
         csp: page.headers.get("content-security-policy") ?? "",
         postStatus: post.status,
         stored: /Stored in vault/.test(postHtml),
-        fingerprintOk: Boolean(fp) && fp[1] === credentialFingerprint && Number(fp[2]) === secrets.credential.length,
+        fingerprintOk: Boolean(fp) && fp[1] === credentialFingerprint && Number(fp[2]) === storedSecret.length,
         replayStatus: replay.status,
         postResponse: postHtml,
         formPage: html,
@@ -402,13 +429,13 @@ async function main() {
     "--vault", vault,
     "--site", SITE,
     "--account", ACCOUNT,
-    "--kind", "api_key",
+    "--kind", KIND,
     "--path", SITE_PATH,
     "--auto",
     "--poll-ms", "700",
     "--timeout-s", "90",
     "--out", transcriptPath,
-    "--fingerprint", `${credentialFingerprint}:${secrets.credential.length}`,
+    "--fingerprint", `${credentialFingerprint}:${storedSecret.length}`,
   ];
   if (!control.reachable) clientArgs.push("--expect-use-error", "entry_use_failed");
   let clientOut = "";
@@ -460,11 +487,17 @@ async function main() {
   // -- entry_use outcome
   const use = transcript?.use ?? null;
   if (control.reachable) {
-    check(`entry_use reached the REAL site: GET https://${SITE}${SITE_PATH} → 200 (it answers ${control.status} without a credential)`, use?.ok === true && use.status === 200 && control.status === 401, `status ${use?.status ?? "-"}`);
+    check(`entry_use reached the REAL site: GET https://${SITE}${SITE_PATH} → 200 (it answers ${control.status} without a credential)`, use?.ok === true && use.status === 200 && control.status === STATUS_WITHOUT_CREDENTIAL, `status ${use?.status ?? "-"}`);
     const body = JSON.stringify(use?.body_shape ?? null);
     const useExchange = (transcript?.exchanges ?? []).filter((e) => e.step === "entry_use").at(-1);
     const data = useExchange?.response?.body?.result?.structuredContent?.data;
-    check("the site echoed the token; the client got it REDACTED", data?.body?.authenticated === true && typeof data?.body?.token === "string" && /^\[REDACTED/.test(data.body.token), `token field as the client saw it: ${typeof data?.body?.token === "string" && !holdsAny(data.body.token, credentialNeedles) ? data.body.token : "(withheld)"}; shape ${body}`);
+    if (COOKIE_MODE) {
+      // /cookies answers {"cookies": {<name>: <value>}} with exactly what it received in the Cookie header.
+      const echoed = data?.body?.cookies?.[COOKIE_NAME];
+      check("the site echoed the cookie it received; the client got its value REDACTED", data?.body?.cookies && Object.keys(data.body.cookies).length === 1 && typeof echoed === "string" && /^\[REDACTED/.test(echoed), `cookie "${COOKIE_NAME}" as the client saw it: ${typeof echoed === "string" && !holdsAny(echoed, credentialNeedles) ? echoed : "(withheld)"}; shape ${body}`);
+    } else {
+      check("the site echoed the token; the client got it REDACTED", data?.body?.authenticated === true && typeof data?.body?.token === "string" && /^\[REDACTED/.test(data.body.token), `token field as the client saw it: ${typeof data?.body?.token === "string" && !holdsAny(data.body.token, credentialNeedles) ? data.body.token : "(withheld)"}; shape ${body}`);
+    }
   } else {
     check("!!! entry_use FAILED CLOSED (entry_use_failed) — NO successful injected request was proven", use?.expected_failure === true && use.error === "entry_use_failed", `error ${use?.error ?? "-"}`);
   }
@@ -491,7 +524,7 @@ async function main() {
 
   // -- where the credential is, and is not
   check("credential IS in the owner's card form POST (the one place it is typed)", holdsAny(owner.cardPostBody ?? "", credentialNeedles));
-  check("credential IS in the fake canonical vault's store, under one entry key", gate.holds(secrets.credential) && gate.count() === 1, `${gate.count()} stored value(s): ${gate.coordinates().map((c) => `${c.service.replace(/_[0-9a-f]{8,}$/, "_…")}/${c.username}`).join(", ")}`);
+  check("credential IS in the fake canonical vault's store, under one entry key", gate.holds(storedSecret) && gate.count() === 1, `${gate.count()} stored value(s): ${gate.coordinates().map((c) => `${c.service.replace(/_[0-9a-f]{8,}$/, "_…")}/${c.username}`).join(", ")}`);
   const absent = (label, haystack) => check(`credential is NOT in ${label}`, haystack !== null && !holdsAny(haystack, credentialNeedles));
   absent("anything the client received or wrote (transcript)", transcript ? transcriptText : null);
   absent("the client's stdout/stderr", clientOut);
@@ -609,6 +642,6 @@ for (const r of rows) out(`${r.ok ? "PASS" : "FAIL"}  ${r.name.padEnd(width)}${r
 const failed = rows.filter((r) => !r.ok).length;
 out("-------------------------------------------------------------------");
 const pass = failed === 0 && rows.length > 0;
-out(`${rows.length - failed} of ${rows.length} checks passed — ${pass ? (failClosedOnly ? "REHEARSAL PASS, FAIL-CLOSED PATH ONLY (the site was unreachable: no successful injected request was proven)" : "REHEARSAL PASS") : "REHEARSAL FAIL"}`);
+out(`${rows.length - failed} of ${rows.length} checks passed${COOKIE_MODE ? " (cookie entry)" : ""} — ${pass ? (failClosedOnly ? "REHEARSAL PASS, FAIL-CLOSED PATH ONLY (the site was unreachable: no successful injected request was proven)" : "REHEARSAL PASS") : "REHEARSAL FAIL"}`);
 out("Not proven by a rehearsal: real Telegram delivery, the real canonical vault, a human owner. See docs/ops/e2e-proof.md.");
 process.exit(failed === 0 && rows.length > 0 ? 0 : 1);

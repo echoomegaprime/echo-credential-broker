@@ -25,6 +25,7 @@
     "lint": "eslint .",
     "format": "prettier --write .",
     "e2e:rehearsal": "node scripts/e2e/rehearsal.mjs",
+    "e2e:rehearsal:cookie": "node scripts/e2e/rehearsal.mjs --cookie",
     "e2e:proof": "node scripts/e2e/proof-client.mjs"
   },
   "dependencies": {

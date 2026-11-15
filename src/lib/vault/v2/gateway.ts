@@ -99,6 +99,7 @@ import {
   listRotationDue,
   deleteEntry,
   getEntryMetadata,
+  refreshCookieJar,
   requestCard,
   resolveEntry,
   useEntry,
@@ -121,6 +122,16 @@ import {
 } from "./github-capabilities.ts";
 import { appendLedger, ledgerHead, listLedger, verifyLedger, type LedgerVerifyResult } from "./ledger.ts";
 import { purgeEntry, rotateEntry, setEntryRotation, type RotationDeps } from "./rotation.ts";
+import {
+  cookieHeaderFor,
+  describeJar,
+  jarRedactionForms,
+  mergeSetCookie,
+  parseStoredJar,
+  serializeJar,
+  type CookieJar,
+  type CookieJarSummary,
+} from "./cookie-jar.ts";
 import { pinnedFetch, type PinnedFetch } from "./pinned-fetch.ts";
 import { anchorHead, newestAnchorVerdict, verifyAnchorLine, type AnchorDeps } from "./ledger-anchor.ts";
 import {
@@ -414,7 +425,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = Object.freeze([
   {
     name: "entry_request_card",
     description:
-      "Ask the owner to type a credential you do not have (or re-enter one that stopped working). The owner gets a single-use link on Telegram; you get only a card_id. Poll entry_card_status. Tier 1, scope vault.write.",
+      "Ask the owner to type a credential you do not have (or re-enter one that stopped working). The owner gets a single-use link on Telegram; you get only a card_id. Poll entry_card_status. Tier 1, scope vault.write. kind \"cookie\" asks for a browser session: the owner pastes that account's cookies for the site (several accounts per site are separate entries).",
     inputSchema: schema(
       {
         site: { type: "string", description: "Domain, e.g. github.com." },
@@ -435,7 +446,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = Object.freeze([
   {
     name: "entry_use",
     description:
-      "Use a credential entry without seeing it: one HTTPS request to the entry's own site (host = the site or api.<site>) with the secret injected server-side (api_key / oauth_token: Authorization: Bearer; password: HTTP Basic with the account). Returns status and a redacted body. GET/HEAD need scope vault.read and the owner's consent, scoped to this entry, host and path: the first such read returns `approval_required`; later reads to that host at that path or under it run without a prompt until the grant expires or its uses run out. Other methods need scope vault.write and are approved per request. A 401 from the site flags that entry for re-entry (site_rejected_credential); a 403 returns site_forbidden and leaves the entry active.",
+      "Use a credential entry without seeing it: one HTTPS request to the entry's own site (host = the site or api.<site>) with the secret injected server-side (api_key / oauth_token: Authorization: Bearer; password: HTTP Basic with the account; cookie: a Cookie header chosen from the stored session cookies for that host and path, and no Authorization header — a cookie entry may also target a subdomain of its site that one of its stored cookies covers, and fails with no_cookie_for_host before any request when nothing matches). Returns status and a redacted body; response headers such as Set-Cookie are never returned (a cookie entry's rotated session cookies are stored server-side). GET/HEAD need scope vault.read and the owner's consent, scoped to this entry, host and path: the first such read returns `approval_required`; later reads to that host at that path or under it run without a prompt until the grant expires or its uses run out. Other methods need scope vault.write and are approved per request. A 401 from the site flags that entry for re-entry (site_rejected_credential); a 403 returns site_forbidden and leaves the entry active.",
     inputSchema: schema(
       {
         site: { type: "string", description: "Domain of the entry, e.g. github.com." },
@@ -900,6 +911,9 @@ function proxyPlan(
 // entry_use: one HTTPS request to the entry's own site
 // ---------------------------------------------------------------------------
 
+/** A syntactically valid lower-case hostname (used for a cookie entry's subdomain host). */
+const SUBDOMAIN_HOST = /^(?=.{1,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$/;
+
 const ENTRY_USE_LIMITS = { maxRequestBytes: 256 * 1024, maxResponseBytes: 1024 * 1024, timeoutMs: 12_000, maxTextChars: 16_384 };
 
 async function defaultResolveHost(host: string): Promise<string[]> {
@@ -931,6 +945,21 @@ interface SiteRequest {
   path: string;
   bodyText?: string;
   contentType?: string;
+  /**
+   * `cookie` entries: called (server-side only) when the response's Set-Cookie headers changed
+   * the jar, with the new canonical jar JSON — a secret — and its metadata. Must not throw.
+   */
+  persistJar?: (jarJson: string, summary: CookieJarSummary) => Promise<void>;
+}
+
+/** A refusal decided before any network activity; `code` becomes the tool error. */
+class SitePreflightError extends Error {
+  readonly code: string;
+  constructor(code: string) {
+    super(code);
+    this.name = "SitePreflightError";
+    this.code = code;
+  }
 }
 
 /**
@@ -950,6 +979,25 @@ async function siteRequest(
     throw new Error("hostname_not_allowed");
   }
   if (isBlockedHost(url.hostname)) throw new Error("hostname_not_allowed");
+
+  // `cookie` entries: the secret is the canonical jar. Every value (and its encoded forms) is
+  // armed for redaction, and the Cookie header is chosen BEFORE anything touches the network:
+  // no cookie for this host/path → no DNS lookup, no connection.
+  let jar: CookieJar | null = null;
+  let cookieHeader: string | null = null;
+  const cookieCtx = { host: url.hostname, path: url.pathname, now: (deps.now ?? Date.now)(), site: entry.site };
+  if (entry.kind === "cookie") {
+    try {
+      jar = parseStoredJar(secret);
+    } catch {
+      throw new SitePreflightError("cookie_jar_invalid");
+    }
+    for (const form of jarRedactionForms(jar)) registerSecretForRedaction(form);
+    cookieHeader = cookieHeaderFor(jar, cookieCtx);
+    if (cookieHeader === null) throw new SitePreflightError("no_cookie_for_host");
+    registerSecretForRedaction(cookieHeader); // a site that echoes the whole header must not hand it back
+  }
+
   let addresses: string[];
   try {
     addresses = await (deps.resolveHost ?? defaultResolveHost)(url.hostname);
@@ -967,15 +1015,19 @@ async function siteRequest(
     "user-agent": "Echo-Credential-Broker/2.0",
     accept: "application/json, text/plain;q=0.9, */*;q=0.5",
   });
-  if (entry.kind === "password") {
+  if (entry.kind === "cookie") {
+    headers.set("cookie", cookieHeader as string); // and no Authorization header
+  } else if (entry.kind === "password") {
     const basic = Buffer.from(`${entry.account}:${secret}`, "utf8").toString("base64");
     registerSecretForRedaction(basic); // a site that echoes headers must not hand the pair back
     headers.set("authorization", `Basic ${basic}`);
   } else {
     headers.set("authorization", `Bearer ${secret}`);
   }
-  const encoded = encodeURIComponent(secret);
-  if (encoded !== secret) registerSecretForRedaction(encoded);
+  if (entry.kind !== "cookie") {
+    const encoded = encodeURIComponent(secret);
+    if (encoded !== secret) registerSecretForRedaction(encoded);
+  }
 
   const init: RequestInit = {
     method: req.method,
@@ -1001,6 +1053,19 @@ async function siteRequest(
         onConnect: (address) => log.info("vault_entry_use_connected", { entry_id: entry.id, host: url.hostname, address }),
       },
     );
+  }
+  // Set-Cookie: applied to the jar server-side (RFC 6265), never returned. The new values are
+  // armed BEFORE the body is redacted, in case the same response also echoes them. A 401 is a
+  // rejected session — the entry is flagged for re-entry and its jar is left as it was.
+  if (jar && res.status !== 401) {
+    const setCookies = typeof res.headers.getSetCookie === "function" ? res.headers.getSetCookie() : [];
+    if (setCookies.length > 0) {
+      const merged = mergeSetCookie(jar, setCookies, cookieCtx);
+      for (const form of jarRedactionForms(merged.jar)) registerSecretForRedaction(form);
+      if (merged.changed && req.persistJar) {
+        await req.persistJar(serializeJar(merged.jar), describeJar(merged.jar, entry.site)).catch(() => undefined);
+      }
+    }
   }
   const raw = await readLimited(res, ENTRY_USE_LIMITS.maxResponseBytes);
   const text = redactString(raw.toString("utf8"));
@@ -1084,8 +1149,16 @@ async function entryUsePlan(a: Record<string, unknown>, env: Env): Promise<Plan>
     throw new ToolInputError("entry_kind_not_usable", "operator_secret entries cannot be injected into a request");
   }
   const host = (optStr(a, "host") ?? entry.site).trim().toLowerCase();
-  if (host !== entry.site && host !== `api.${entry.site}`) {
-    throw new ToolInputError("hostname_not_allowed", `host must be ${entry.site} or api.${entry.site}`);
+  // A cookie entry may also target a subdomain of its own site. Whether a stored cookie actually
+  // covers that host (and path) is decided inside the use, where the jar is: no_cookie_for_host.
+  const cookieSubdomain = entry.kind === "cookie" && host.endsWith(`.${entry.site}`) && SUBDOMAIN_HOST.test(host);
+  if (host !== entry.site && host !== `api.${entry.site}` && !cookieSubdomain) {
+    throw new ToolInputError(
+      "hostname_not_allowed",
+      entry.kind === "cookie"
+        ? `host must be ${entry.site}, api.${entry.site} or a subdomain of ${entry.site} covered by a stored cookie`
+        : `host must be ${entry.site} or api.${entry.site}`,
+    );
   }
   if (isBlockedHost(host)) throw new ToolInputError("hostname_not_allowed", "that host is not reachable through the broker");
 
@@ -1126,13 +1199,25 @@ async function entryUsePlan(a: Record<string, unknown>, env: Env): Promise<Plan>
       const status = () => (seen as { status: number } | null)?.status;
       const is401 = () => status() === 401;
       const is403 = () => status() === 403;
+      let preflight: string | null = null;
+      // A rotated cookie jar is written back by cards.ts (backend + metadata) and ledgered on the
+      // gateway's chain; it can only make the NEXT use work, never fail this one.
+      const persistJar = async (jarJson: string, summary: CookieJarSummary): Promise<void> => {
+        await refreshCookieJar(entry.id, env.identity, jarJson, summary, { ...env.deps.cards, ledger: (row) => ledger(row) });
+      };
       try {
         const used = await useEntry(
           entry.id,
           env.identity,
           task,
           async (secret, meta) => {
-            const response = await siteRequest(secret, meta, { host, method, path, bodyText, contentType }, env.deps);
+            let response: Awaited<ReturnType<typeof siteRequest>>;
+            try {
+              response = await siteRequest(secret, meta, { host, method, path, bodyText, contentType, persistJar }, env.deps);
+            } catch (err) {
+              if (err instanceof SitePreflightError) preflight = err.code;
+              throw err;
+            }
             seen = { status: response.status };
             // A 401 means the site rejected the credential: flag THIS entry for
             // re-entry (other accounts on the same site are untouched). A 403 is
@@ -1157,7 +1242,10 @@ async function entryUsePlan(a: Record<string, unknown>, env: Env): Promise<Plan>
               const row: LedgerEntryInput = { ...input, capability, task };
               const s = status();
               if (s !== undefined) row.http_status = s;
-              if (is401()) {
+              if (preflight) {
+                row.result = "error";
+                row.error = preflight;
+              } else if (is401()) {
                 row.result = "error";
                 row.error = "site_rejected_credential";
               } else if (is403()) {
@@ -1201,6 +1289,13 @@ async function entryUsePlan(a: Record<string, unknown>, env: Env): Promise<Plan>
         }
         return { ledgered, audit, result: { ok: true, data: { entry: agentEntryView(used.entry), ...response } } };
       } catch (err) {
+        if (preflight) {
+          const detail =
+            preflight === "no_cookie_for_host"
+              ? `No stored cookie of this entry applies to https://${host}${clip(path.split(/[?#]/)[0], 160)} (domain, path or expiry). Nothing was sent.`
+              : "The stored cookie jar of this entry could not be read. Ask the owner to re-enter it with entry_request_card (entry_id).";
+          return { ledgered, audit, result: { ok: false, error: preflight, detail, entry_id: entry.id } };
+        }
         return { ledgered, audit, result: entryFailure(err) };
       }
     },

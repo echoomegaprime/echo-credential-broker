@@ -770,7 +770,7 @@ runSuite("sql stores on PGlite", async () => {
   pglite ??= (async () => {
     const { PGlite } = await import("@electric-sql/pglite");
     const pg = new PGlite();
-    for (const file of ["0005_vault_entries.sql", "0007_vault_entry_rotation.sql"]) {
+    for (const file of ["0005_vault_entries.sql", "0007_vault_entry_rotation.sql", "0012_vault_cookie_entries.sql"]) {
       await pg.exec(readFileSync(new URL(`../../../../migrations/${file}`, import.meta.url), "utf8"));
     }
     return pg;
