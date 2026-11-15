@@ -14,11 +14,29 @@
  * `locate` returns coordinates, never a secret, and never picks for you.
  */
 
+import { GateSigningError, signGateRequest } from "./gate-hmac.ts";
 import { log } from "./log.ts";
 
 const GATE_URL = (process.env.ECHO_SDK_GATE_URL || "https://forge.echo-op.com").replace(/\/+$/, "");
 const API_KEY = process.env.ECHO_SDK_API_KEY || "";
+/** Per-key `secret_hmac` the gate holds for ECHO_SDK_API_KEY (hex). Signs every call; required for tier 2+. */
+const HMAC_SECRET = process.env.ECHO_SDK_HMAC_SECRET || "";
 const TIMEOUT_MS = 10_000;
+
+/**
+ * Capabilities the gate registers at danger tier 2 or higher. It answers these with
+ * 423 `hmac_required_for_tier2_plus` unless the envelope is signed (gate-hmac.ts), so an
+ * unsigned call is refused here, with a reason an operator can act on, before any byte
+ * (including the secret of a put) leaves this process.
+ */
+const SIGNATURE_REQUIRED = new Set(["echo.vault.put"]);
+
+/** The gate's own short error code from a refusal body (`{detail:{error}}`), if it has one. Never a value. */
+function gateErrorCode(body: unknown): string | undefined {
+  const detail = (body as { detail?: unknown } | null)?.detail;
+  const code = (detail as { error?: unknown } | null)?.error;
+  return typeof code === "string" && /^[a-z0-9_]{1,64}$/.test(code) ? code : undefined;
+}
 
 /** Safe-to-log view of gate params — `secret` is the one field that must never reach a log line. */
 function safeParams(params: Record<string, unknown>): Record<string, unknown> {
@@ -51,6 +69,22 @@ async function invoke<T>(capability: string, params: Record<string, unknown>, by
     log.error("gate_call_no_key", { capability, params: safeParams(params) });
     throw new GateUnavailableError("ECHO_SDK_API_KEY is not configured — refusing to call the vault gate without auth.");
   }
+  if (!HMAC_SECRET && SIGNATURE_REQUIRED.has(capability)) {
+    log.error("gate_call_unsigned", { capability, params: safeParams(params) });
+    throw new GateUnavailableError(
+      `ECHO_SDK_HMAC_SECRET is not configured — the gate refuses ${capability} (tier 2) without a signed envelope.`,
+    );
+  }
+  let auth: ReturnType<typeof signGateRequest> | undefined;
+  if (HMAC_SECRET) {
+    try {
+      auth = signGateRequest(HMAC_SECRET, API_KEY, capability, params);
+    } catch (error) {
+      const code = error instanceof GateSigningError ? error.code : "gate_signing_failed";
+      log.error("gate_call_signing_failed", { capability, params: safeParams(params), code });
+      throw new GateUnavailableError(`could not sign the gate call ${capability}: ${code}`);
+    }
+  }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
   try {
@@ -62,6 +96,7 @@ async function invoke<T>(capability: string, params: Record<string, unknown>, by
         capability,
         params,
         context: { bypass_reason: bypassReason },
+        ...(auth ? { auth } : {}),
       }),
       signal: controller.signal,
     });
@@ -72,6 +107,8 @@ async function invoke<T>(capability: string, params: Record<string, unknown>, by
         capability,
         params: safeParams(params),
         http_status: res.status,
+        gate_error: gateErrorCode(envelope),
+        signed: Boolean(auth),
         envelope_status: envelope.status,
         body_status: envelope.result?.status_code,
         run_id: envelope.run_id,

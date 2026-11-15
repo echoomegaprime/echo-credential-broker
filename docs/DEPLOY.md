@@ -37,6 +37,7 @@ Work top to bottom. Nothing here needs a secret pasted into a chat.
 
 - [ ] `ECHO_VAULT_PUBLIC_URL` = the public https origin, no path (for example `https://credbroker.echo-op.com`).
 - [ ] `ECHO_SDK_API_KEY` (and `ECHO_SDK_GATE_URL` if not the default) so the broker can reach the canonical vault.
+- [ ] `ECHO_SDK_HMAC_SECRET`: the gate's per-key `secret_hmac` for that API key (hex). Without it every card submit fails with "vault unavailable": the gate answers `echo.vault.put` (tier 2) with 423 `hmac_required_for_tier2_plus` unless the call is signed. Provision it on the gate with `echo.auth.rotate_hmac`.
 - [ ] `ECHO_VAULT_LEDGER_HMAC_KEY` (32+ characters). Set it before the first request; keep it out of the database.
 - [ ] `ECHO_VAULT_ANCHOR_KEY` (32+ characters) so ledger anchors are signed. Keep it out of the database.
 - [ ] Leave `ECHO_VAULT_CONSOLE` (the legacy read-only page) unset on a public host.

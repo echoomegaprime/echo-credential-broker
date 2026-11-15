@@ -1,6 +1,6 @@
 // library-first: echo.functions.search → no existing impl found (2026-11-14)
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createHmac, createHash } from "node:crypto";
 import { test } from "node:test";
 import {
   Masker,
@@ -127,20 +127,51 @@ test("fake Telegram helpers read the vault's approval keyboard and card link", (
 test("fake gate speaks the gate-client envelope, checks the API key and never records a secret", async (t) => {
   const apiKey = "testonly-gate-key";
   const secret = "throwaway-test-value-123";
-  const gate = await startFakeGate({ apiKey });
+  const hmacSecret = "ab".repeat(32);
+  await assert.rejects(startFakeGate({ apiKey }), /hmacSecret/);
+  const gate = await startFakeGate({ apiKey, hmacSecret });
   t.after(() => gate.close());
-  const invoke = async (capability, params, key = apiKey) => {
+  let n = 0;
+  // The gate's rule for tier 2: HMAC-SHA256 over "v1|key|capability|params|nonce|ts". The params
+  // here are ASCII with keys already in sorted order, so JSON.stringify is the canonical form.
+  const sign = (capability, params, over = {}) => {
+    const ts = over.ts ?? Math.floor(Date.now() / 1000);
+    const nonce = over.nonce ?? `nonce-${++n}-${Date.now()}`;
+    const msg = `v1|${apiKey}|${capability}|${JSON.stringify(params)}|${nonce}|${ts}`;
+    return { hmac: over.hmac ?? createHmac("sha256", Buffer.from(hmacSecret, "hex")).update(msg).digest("hex"), nonce, ts };
+  };
+  const invoke = async (capability, params, key = apiKey, auth = capability === "echo.vault.put" ? sign(capability, params) : undefined) => {
     const res = await fetch(`${gate.url}/sdk/invoke`, {
       method: "POST",
       headers: { "X-Echo-API-Key": key, "Content-Type": "application/json" },
-      body: JSON.stringify({ envelope_version: 1, capability, params, context: { bypass_reason: "test" } }),
+      body: JSON.stringify({ envelope_version: 1, capability, params, context: { bypass_reason: "test" }, ...(auth ? { auth } : {}) }),
     });
     return { http: res.status, envelope: await res.json() };
   };
 
+  // Tier 2 is refused exactly as the real gate refuses it, before anything is stored.
+  const P = { note: "n", secret, service: "locked", username: "entry" };
+  const unsigned = await invoke("echo.vault.put", P, apiKey, null);
+  assert.equal(unsigned.http, 423);
+  assert.equal(unsigned.envelope.detail.error, "hmac_required_for_tier2_plus");
+  for (const [auth, reason] of [
+    [sign("echo.vault.put", P, { hmac: "0".repeat(64) }), "hmac_signature_mismatch"],
+    [sign("echo.vault.put", { ...P, secret: "tampered" }), "hmac_signature_mismatch"],
+    [sign("echo.vault.put", P, { ts: Math.floor(Date.now() / 1000) - 600 }), "hmac_ts_out_of_window"],
+    [{ hmac: "ab", nonce: "", ts: 1 }, "hmac_fields_missing"],
+  ]) {
+    const r = await invoke("echo.vault.put", P, apiKey, auth);
+    assert.equal(r.http, 401, reason);
+    assert.equal(r.envelope.detail.reason, reason);
+  }
+  const once = sign("echo.vault.put", P);
+  assert.equal((await invoke("echo.vault.put", P, apiKey, once)).envelope.status, "ok");
+  assert.equal((await invoke("echo.vault.put", P, apiKey, once)).envelope.detail.reason, "nonce_replay_detected");
+  assert.ok(!JSON.stringify(gate.traffic).includes(secret));
+
   assert.equal((await invoke("echo.vault.locate", { service: "svc" }, "wrong-key")).http, 401);
   assert.equal((await invoke("echo.vault.locate", { service: "svc" })).envelope.result.body.status, "NOT_FOUND");
-  const put = await invoke("echo.vault.put", { service: "svc", username: "entry", secret, note: "n" });
+  const put = await invoke("echo.vault.put", { note: "n", secret, service: "svc", username: "entry" });
   assert.equal(put.envelope.status, "ok");
   assert.equal(put.envelope.result.body.stored, true);
   const located = (await invoke("echo.vault.locate", { service: "svc" })).envelope.result.body;
