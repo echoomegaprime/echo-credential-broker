@@ -551,6 +551,12 @@ async function main() {
   for (let i = 1; i < ledger.length && linked; i += 1) linked = ledger[i].prev_hash === ledger[i - 1].hash && ledger[i].seq === ledger[i - 1].seq + 1;
   check("ledger rows link into one chain from genesis (prev_hash = previous hash), every row has an HMAC", linked && ledger.every((r) => typeof r.hmac === "string" && r.hmac.length === 64), `${ledger.length} rows`);
   check("the vault's own audit_verify reported the chain intact", transcript?.chain?.ok === true, `count ${transcript?.chain?.count ?? "-"}`);
+  const taps = ledger.filter((r) => r.capability === "vault.approval.decide" && r.client_id === "owner:telegram");
+  check(
+    "ledger: both owner decisions are on the chain (vault.approval.decide: the connection, then the first use)",
+    taps.length === 2 && taps.every((r) => r.decision === "allow" && r.result === "ok" && r.approval_id) && /^vault\.client\.authorize /.test(taps[0]?.resource ?? "") && /^vault\.entry\.use\.read /.test(taps[1]?.resource ?? ""),
+    taps.map((r) => `seq ${r.seq}`).join(", ") || "missing",
+  );
   const cardRow = mine.find((r) => r.capability === "vault.card.request");
   const pendingUse = mine.find((r) => r.capability === "vault.entry.use.read" && r.result === "pending_approval");
   const doneUse = mine.find((r) => r.capability === "vault.entry.use.read" && r.approval_id && r.result !== "pending_approval");
