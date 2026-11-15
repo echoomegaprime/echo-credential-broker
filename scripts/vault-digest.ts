@@ -11,6 +11,7 @@
  */
 import { installProcessRedaction } from "../src/lib/vault/redaction.ts";
 import { sendDailyDigest } from "../src/lib/vault/v2/digest.ts";
+import { defaultDigestSections } from "../src/lib/vault/v2/digest-sections.ts";
 
 installProcessRedaction();
 
@@ -32,7 +33,7 @@ async function main(): Promise<number> {
     process.stdout.write(`${JSON.stringify({ sent: false, reason: "usage", detail: "vault-digest.ts [--from <iso>] [--to <iso>]" })}\n`);
     return 1;
   }
-  const result = await sendDailyDigest({}, opts);
+  const result = await sendDailyDigest({ extraSections: defaultDigestSections() }, opts);
   process.stdout.write(`${JSON.stringify(result)}\n`);
   return result.sent || result.reason === "already_sent" ? 0 : 1;
 }

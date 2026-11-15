@@ -93,6 +93,13 @@ function entry(id: string, label: string, status: EntryMetadata["status"], updat
     last_used_at: null,
     last_verified_at: null,
     reentry_reason: status === "needs_reentry" ? "example.com answered 401 to GET" : undefined,
+    rotation_mode: "manual",
+    rotate_interval_days: null,
+    last_rotated_at: null,
+    rotate_by: null,
+    rotation_count: 0,
+    last_rotation_error: null,
+    provider_token_id: null,
   };
 }
 
