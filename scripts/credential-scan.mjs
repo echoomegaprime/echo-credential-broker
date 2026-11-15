@@ -16,7 +16,12 @@
  *
  *   node credential-scan.mjs --root C:\Users\me --root D:\ --out scan.json
  *   node credential-scan.mjs --all-drives --out scan.json
+ *
+ * --all-drives covers LOCAL fixed drives only: a mapped network drive belongs to
+ * another node, which scans itself (add --include-network-drives to override).
+ * A directory that does not answer within 15s is skipped and counted.
  */
+import { execFile } from "node:child_process";
 import { createHmac, randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
 import { open, readdir, stat } from "node:fs/promises";
@@ -187,16 +192,46 @@ export function loadNodeKey(file) {
   return key;
 }
 
-export async function listDriveRoots() {
+/** Reject after `ms` so one dead mount cannot hang the whole scan. The I/O itself is abandoned. */
+export function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`timeout:${label}`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+function run(file, args, ms) {
+  return new Promise((resolvePromise) => {
+    execFile(file, args, { timeout: ms, windowsHide: true }, (err, stdout) => resolvePromise(err ? null : String(stdout)));
+  });
+}
+
+/**
+ * Local fixed drives only. A mapped network drive belongs to another node (which
+ * scans itself); removable letters with no media hang. Windows: DriveType 3.
+ * Pass includeNetwork to scan mapped drives too.
+ */
+export async function listDriveRoots(opts = {}) {
   if (platform() !== "win32") return ["/"];
+  const types = opts.includeNetwork ? "3,4" : "3";
+  const out = await run(
+    "powershell.exe",
+    ["-NoProfile", "-NonInteractive", "-Command", `(Get-CimInstance Win32_LogicalDisk | Where-Object { @(${types}) -contains $_.DriveType }).DeviceID -join ','`],
+    20_000,
+  );
+  if (out && /[A-Za-z]:/.test(out)) {
+    return out.trim().split(",").map((d) => d.trim()).filter((d) => /^[A-Za-z]:$/.test(d)).map((d) => `${d.toUpperCase()}\\`);
+  }
+  // Fallback when PowerShell/CIM is unavailable: probe letters, each with a short timeout.
   const roots = [];
   for (let c = 67; c <= 90; c++) {
     const root = `${String.fromCharCode(c)}:\\`;
     try {
-      await stat(root);
+      await withTimeout(stat(root), 3000, root);
       roots.push(root);
     } catch {
-      /* no such drive */
+      /* no such drive, no media, or unreachable */
     }
   }
   return roots;
@@ -204,12 +239,14 @@ export async function listDriveRoots() {
 
 /**
  * Walk `roots` and return a manifest of references.
- * @param {{roots:string[], key:Buffer, maxFileBytes?:number, excludes?:string[], maxFiles?:number, onProgress?:(n:number)=>void}} opts
+ * @param {{roots:string[], key:Buffer, maxFileBytes?:number, excludes?:string[], maxFiles?:number, dirTimeoutMs?:number, onProgress?:(s:object)=>void}} opts
  */
 export async function scan(opts) {
   const maxFileBytes = opts.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES;
   const excludes = (opts.excludes ?? []).map((e) => resolve(e).toLowerCase());
-  const stats = { dirs: 0, files_seen: 0, files_scanned: 0, files_skipped_large: 0, files_skipped_binary: 0, errors: 0 };
+  const dirTimeoutMs = opts.dirTimeoutMs ?? 15_000;
+  const stats = { dirs: 0, files_seen: 0, files_scanned: 0, files_skipped_large: 0, files_skipped_binary: 0, dirs_timed_out: 0, errors: 0 };
+  let lastBeat = Date.now();
   const findings = [];
   const stack = opts.roots.map((r) => resolve(r));
   const started = Date.now();
@@ -217,12 +254,17 @@ export async function scan(opts) {
     const dir = stack.pop();
     let entries;
     try {
-      entries = await readdir(dir, { withFileTypes: true });
-    } catch {
-      stats.errors++;
+      entries = await withTimeout(readdir(dir, { withFileTypes: true }), dirTimeoutMs, "readdir");
+    } catch (err) {
+      if (err instanceof Error && err.message.startsWith("timeout:")) stats.dirs_timed_out++;
+      else stats.errors++;
       continue;
     }
     stats.dirs++;
+    if (opts.onProgress && Date.now() - lastBeat >= 15_000) {
+      lastBeat = Date.now();
+      opts.onProgress({ dirs: stats.dirs, files_scanned: stats.files_scanned, findings: findings.length, at: dir });
+    }
     for (const e of entries) {
       const full = join(dir, e.name);
       if (e.isSymbolicLink()) continue;
@@ -238,7 +280,7 @@ export async function scan(opts) {
       if (opts.maxFiles && stats.files_scanned >= opts.maxFiles) continue;
       let info;
       try {
-        info = await stat(full);
+        info = await withTimeout(stat(full), dirTimeoutMs, "stat");
       } catch {
         stats.errors++;
         continue;
@@ -252,7 +294,7 @@ export async function scan(opts) {
       try {
         const fh = await open(full, "r");
         try {
-          buf = await fh.readFile();
+          buf = await withTimeout(fh.readFile(), dirTimeoutMs * 2, "read");
         } finally {
           await fh.close();
         }
@@ -265,7 +307,6 @@ export async function scan(opts) {
         continue;
       }
       stats.files_scanned++;
-      if (opts.onProgress && stats.files_scanned % 5000 === 0) opts.onProgress(stats.files_scanned);
       for (const f of scanText(buf.toString("utf8"), opts.key)) {
         findings.push({ path: full, file: basename(full), mtime: info.mtime.toISOString(), size: info.size, ...f });
       }
@@ -303,13 +344,14 @@ export async function scan(opts) {
 }
 
 function parseArgs(argv) {
-  const out = { roots: [], excludes: [], allDrives: false, out: null, keyFile: null, maxFileBytes: undefined, maxFiles: undefined };
+  const out = { roots: [], excludes: [], allDrives: false, includeNetwork: false, out: null, keyFile: null, maxFileBytes: undefined, maxFiles: undefined };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const next = () => argv[++i];
     if (a === "--root") out.roots.push(next());
     else if (a === "--exclude") out.excludes.push(next());
     else if (a === "--all-drives") out.allDrives = true;
+    else if (a === "--include-network-drives") out.includeNetwork = true;
     else if (a === "--out") out.out = next();
     else if (a === "--hmac-key-file") out.keyFile = next();
     else if (a === "--max-file-bytes") out.maxFileBytes = Number(next());
@@ -322,7 +364,7 @@ function parseArgs(argv) {
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (!args.out) throw new Error("--out <manifest.json> is required (the manifest stays on this node)");
-  const roots = args.allDrives ? await listDriveRoots() : args.roots;
+  const roots = args.allDrives ? await listDriveRoots({ includeNetwork: args.includeNetwork }) : args.roots;
   if (roots.length === 0) throw new Error("give --root <path> (repeatable) or --all-drives");
   const key = loadNodeKey(args.keyFile);
   const manifest = await scan({
@@ -331,7 +373,8 @@ async function main() {
     excludes: args.excludes,
     maxFileBytes: args.maxFileBytes,
     maxFiles: args.maxFiles,
-    onProgress: (n) => process.stderr.write(`scanned ${n} files\n`),
+    // Heartbeat: counters and the directory being walked — a path, never contents.
+    onProgress: (p) => process.stderr.write(`${new Date().toISOString()} ${JSON.stringify(p)}\n`),
   });
   mkdirSync(dirname(resolve(args.out)), { recursive: true });
   writeFileSync(args.out, JSON.stringify(manifest, null, 2), { mode: 0o600 });

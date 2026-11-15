@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { entropy, fingerprint, scan, scanText } from "./credential-scan.mjs";
+import { entropy, fingerprint, listDriveRoots, scan, scanText, withTimeout } from "./credential-scan.mjs";
 
 const SCRIPT = fileURLToPath(new URL("./credential-scan.mjs", import.meta.url));
 const KEY = Buffer.alloc(32, 7);
@@ -135,6 +135,27 @@ describe("credential-scan: walking a tree", () => {
       assert.ok(!r.stdout.includes(s) && !r.stderr.includes(s), "CLI output leaked a secret value");
     }
     assert.equal(readFileSync(keyFile).length, 32);
+  });
+
+  it("withTimeout rejects a hung operation and passes a fast one through", async () => {
+    await assert.rejects(withTimeout(new Promise(() => {}), 20, "hung"), /timeout:hung/);
+    assert.equal(await withTimeout(Promise.resolve(7), 1000, "fast"), 7);
+  });
+
+  it("a root that cannot be read is counted, not fatal, and the heartbeat carries no contents", async () => {
+    const beats = [];
+    const manifest = await scan({ roots: [join(dir, "does-not-exist"), dir], key: KEY, maxFileBytes: 4096, onProgress: (p) => beats.push(p) });
+    assert.equal(manifest.stats.errors, 1);
+    assert.equal(manifest.stats.dirs_timed_out, 0);
+    assert.ok(manifest.summary.findings >= 3);
+    for (const s of Object.values(SECRETS)) assert.ok(!JSON.stringify(beats).includes(s));
+  });
+
+  it("listDriveRoots returns at least one root on this platform", async () => {
+    const roots = await listDriveRoots();
+    assert.ok(roots.length >= 1);
+    if (process.platform !== "win32") assert.deepEqual(roots, ["/"]);
+    else for (const r of roots) assert.match(r, /^[A-Z]:\\$/);
   });
 
   it("CLI refuses to run without --out", () => {
