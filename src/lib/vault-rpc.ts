@@ -106,8 +106,10 @@ function parseArgs(raw: unknown): ToolArgs {
  *     never on the public deployment.
  *   - When on, every call goes through the same gateway as any agent
  *     (dispatchTool) as the fixed identity `local:vault-console`, which holds
- *     READ scopes only. Writes, approvals-required actions and tier-3 actions
- *     get the same answers an under-scoped agent would get.
+ *     READ scopes only and is NOT a local/owner identity for the gateway.
+ *     Writes, approvals-required actions and tier-3 actions (every admin_*
+ *     tool) get the same answers an under-scoped agent would get. Owner
+ *     management lives in the passkey console under /console.
  *   - There is no reveal. Reading a secret value is tier 3 ("never through
  *     this broker"): use the canonical vault directly.
  */
@@ -131,7 +133,11 @@ async function consoleCall(name: string, args: Record<string, unknown>): Promise
   }
   const { dispatchTool } = await import("./vault/v2/gateway.ts");
   return asRpc(
-    await dispatchTool({ client_id: "local:vault-console", name: "Vault console", kind: "local", scopes: [...CONSOLE_SCOPES] }, name, args),
+    // kind "workload", NOT "local": this is an unauthenticated web RPC, not the
+    // stdio process. With kind "local" the gateway's admin carve-out would hand
+    // every admin_* tool (purge, revoke, console bootstrap) to anyone who can
+    // reach the port. As a workload it gets tier3_human_only like any agent.
+    await dispatchTool({ client_id: "local:vault-console", name: "Vault console", kind: "workload", scopes: [...CONSOLE_SCOPES] }, name, args),
   );
 }
 

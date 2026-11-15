@@ -177,7 +177,7 @@ export function sameOriginPost(request: Request, env: NodeJS.ProcessEnv = proces
 }
 
 /** Read at most `limit` bytes; null when the body is larger (the rest is not buffered). */
-async function readLimited(request: Request, limit: number): Promise<string | null> {
+export async function readLimited(request: Request, limit: number): Promise<string | null> {
   const declared = Number(request.headers.get("content-length") ?? "0");
   if (Number.isFinite(declared) && declared > limit) return null;
   if (!request.body) return "";

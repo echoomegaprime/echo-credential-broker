@@ -19,11 +19,14 @@ export type Decision = "allow" | "escalate" | "deny";
 
 /** An authenticated caller. Never derived from a self-asserted header. */
 export interface ClientIdentity {
-  /** Stable ID: "oc_<random>" for OAuth clients, "local:<name>" for stdio, "workload:<name>" for node services. */
+  /**
+   * Stable ID: "oc_<random>" for OAuth clients, "local:<name>" for stdio, "workload:<name>" for node services,
+   * "owner:<12 hex>" for the owner's passkey console session (minted only by owner-console.ts).
+   */
   client_id: string;
   /** Display name, e.g. "Claude". */
   name: string;
-  kind: "oauth" | "local" | "workload";
+  kind: "oauth" | "local" | "workload" | "owner";
   /** Granted scopes, e.g. ["github.read", "github.write"]. */
   scopes: string[];
 }

@@ -16,8 +16,10 @@
  *     4. ledger(ok | error). A result that cannot be ledgered is not returned.
  *
  * `identity` comes from the transport's authentication (OAuth bearer token,
- * workload token, or the local stdio process) — never from a caller-supplied
- * header or argument. `approval_id` is never part of the digested params, so a
+ * workload token, the local stdio process, or the owner's passkey console
+ * session) — never from a caller-supplied header or argument. An `owner`
+ * identity is accepted only when owner-console.ts minted that very object
+ * (owner-identity.ts); no HTTP transport can produce one. `approval_id` is never part of the digested params, so a
  * retry with the approval hashes to the same request the owner approved.
  *
  * Tiers come from policy-engine.ts. Three rules live here because they depend
@@ -95,6 +97,8 @@ import {
   getCardStatus,
   listEntries,
   listRotationDue,
+  deleteEntry,
+  getEntryMetadata,
   requestCard,
   resolveEntry,
   useEntry,
@@ -106,6 +110,7 @@ import type { CapabilityRequest, ClientIdentity, LedgerEntryInput, PolicyDecisio
 import { buildDigest, DigestError, formatDigest, resolveDigestWindow, sendDigest, type DigestDeps } from "./digest.ts";
 import { getDefaultEntryGrantStore, listEntryGrants, revokeEntryGrant, type EntryGrantStore } from "./entry-grants.ts";
 import { listClients, revokeClient, setClientScopes } from "./identity.ts";
+import { isMintedOwnerIdentity, mintBootstrapCode, OWNER_CLIENT_ID_PATTERN, type BootstrapDeps } from "./owner-identity.ts";
 import type { GithubAppDeps } from "./github-app.ts";
 import {
   GITHUB_CAPABILITIES,
@@ -176,6 +181,8 @@ export interface GatewayDeps {
   env?: NodeJS.ProcessEnv;
   /** admin_digest_now wiring (ledger source, sent-window state, Telegram fetch). */
   digest?: DigestDeps;
+  /** admin_console_bootstrap wiring (console store, clock). */
+  console?: BootstrapDeps;
 }
 
 /** Consent-grant TTL and use cap from the environment (change #1). */
@@ -472,25 +479,25 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = Object.freeze([
   {
     name: "admin_anchor_now",
     description:
-      "OWNER ONLY (local stdio): verify the ledger and publish its head (seq, chain hash, row count) to the owner's Telegram chat as an external anchor. Sends nothing when the head has not moved. Any remote caller is refused (tier 3).",
+      "OWNER ONLY (local stdio or the passkey console): verify the ledger and publish its head (seq, chain hash, row count) to the owner's Telegram chat as an external anchor. Sends nothing when the head has not moved. Any remote caller is refused (tier 3).",
     inputSchema: schema({}),
   },
   {
     name: "admin_verify_anchor",
     description:
-      "OWNER ONLY (local stdio): check an `ECHO-VAULT-ANCHOR v1 …` line copied from Telegram against the current ledger. Verdict: ok / truncated / rewritten / anchor_mac_invalid / anchor_ahead_of_ledger. Any remote caller is refused (tier 3).",
+      "OWNER ONLY (local stdio or the passkey console): check an `ECHO-VAULT-ANCHOR v1 …` line copied from Telegram against the current ledger. Verdict: ok / truncated / rewritten / anchor_mac_invalid / anchor_ahead_of_ledger. Any remote caller is refused (tier 3).",
     inputSchema: schema({ line: { type: "string", maxLength: 400, description: "The full anchor message text." } }, ["line"]),
   },
   {
     name: "admin_list_clients",
     description:
-      "OWNER ONLY (local stdio): list the OAuth clients, their status and granted scopes. Any remote/OAuth/workload caller is refused (tier 3).",
+      "OWNER ONLY (local stdio or the passkey console): list the OAuth clients, their status and granted scopes. Any remote/OAuth/workload caller is refused (tier 3).",
     inputSchema: schema({}),
   },
   {
     name: "admin_set_client_scopes",
     description:
-      "OWNER ONLY (local stdio): set an approved client's granted scopes. Any remote caller is refused (tier 3).",
+      "OWNER ONLY (local stdio or the passkey console): set an approved client's granted scopes. Any remote caller is refused (tier 3).",
     inputSchema: schema(
       {
         client_id: { type: "string" },
@@ -502,19 +509,19 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = Object.freeze([
   {
     name: "admin_revoke_client",
     description:
-      "OWNER ONLY (local stdio): revoke a client (kill switch): drop its grant and tokens. Any remote caller is refused (tier 3).",
+      "OWNER ONLY (local stdio or the passkey console): revoke a client (kill switch): drop its grant and tokens. Any remote caller is refused (tier 3).",
     inputSchema: schema({ client_id: { type: "string" } }, ["client_id"]),
   },
   {
     name: "admin_list_grants",
     description:
-      "OWNER ONLY (local stdio): list entry consent grants (metadata only), optionally filtered by client or entry. Any remote caller is refused (tier 3).",
+      "OWNER ONLY (local stdio or the passkey console): list entry consent grants (metadata only), optionally filtered by client or entry. Any remote caller is refused (tier 3).",
     inputSchema: schema({ client_id: { type: "string" }, entry_id: { type: "string" } }),
   },
   {
     name: "admin_revoke_grant",
     description:
-      "OWNER ONLY (local stdio): revoke a client's consent for an entry — one narrow grant (give host + path_prefix) or all grants for the pair. The client's next read re-prompts. Any remote caller is refused (tier 3).",
+      "OWNER ONLY (local stdio or the passkey console): revoke a client's consent for an entry — one narrow grant (give host + path_prefix) or all grants for the pair. The client's next read re-prompts. Any remote caller is refused (tier 3).",
     inputSchema: schema(
       {
         client_id: { type: "string" },
@@ -528,7 +535,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = Object.freeze([
   {
     name: "admin_list_entries",
     description:
-      "OWNER ONLY (local stdio): list credential entries with full metadata (including fingerprint and length). Still never a secret value. Any remote caller is refused (tier 3).",
+      "OWNER ONLY (local stdio or the passkey console): list credential entries with full metadata (including fingerprint and length). Still never a secret value. Any remote caller is refused (tier 3).",
     inputSchema: schema({
       site: { type: "string", description: "Limit to one site." },
       query: { type: "string", description: "Case-insensitive substring of the entry label." },
@@ -537,7 +544,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = Object.freeze([
   {
     name: "admin_set_rotation",
     description:
-      "OWNER ONLY (local stdio): set an entry's rotation policy. mode manual = re-enter on a card; mode auto = the provider rotator rolls it (Cloudflare API tokens: provider_token_id is the 32-hex token ID, never the token). Metadata only. Any remote caller is refused (tier 3).",
+      "OWNER ONLY (local stdio or the passkey console): set an entry's rotation policy. mode manual = re-enter on a card; mode auto = the provider rotator rolls it (Cloudflare API tokens: provider_token_id is the 32-hex token ID, never the token). Metadata only. Any remote caller is refused (tier 3).",
     inputSchema: schema(
       {
         entry_id: { type: "string" },
@@ -551,30 +558,51 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = Object.freeze([
   {
     name: "admin_rotate_entry",
     description:
-      "OWNER ONLY (local stdio): auto-rotate one entry now through its provider rotator. The new secret goes straight to the vault; the result is metadata only. Any remote caller is refused (tier 3).",
+      "OWNER ONLY (local stdio or the passkey console): auto-rotate one entry now through its provider rotator. The new secret goes straight to the vault; the result is metadata only. Any remote caller is refused (tier 3).",
     inputSchema: schema({ entry_id: { type: "string" } }, ["entry_id"]),
   },
   {
     name: "admin_rotation_due",
     description:
-      "OWNER ONLY (local stdio): list entries whose rotation is due (metadata only). Any remote caller is refused (tier 3).",
+      "OWNER ONLY (local stdio or the passkey console): list entries whose rotation is due (metadata only). Any remote caller is refused (tier 3).",
     inputSchema: schema({}),
   },
   {
     name: "admin_purge_entry",
     description:
-      "OWNER ONLY (local stdio): IRREVERSIBLY destroy an entry — its stored secret, its row, its cards and all consent grants. confirm must be exactly \"PURGE <entry_id>\". Any remote caller is refused (tier 3).",
+      "OWNER ONLY (local stdio or the passkey console): IRREVERSIBLY destroy an entry — its stored secret, its row, its cards and all consent grants. confirm must be exactly \"PURGE <entry_id>\". Any remote caller is refused (tier 3).",
     inputSchema: schema({ entry_id: { type: "string" }, confirm: { type: "string" } }, ["entry_id", "confirm"]),
   },
   {
     name: "admin_digest_now",
     description:
-      "OWNER ONLY (local stdio): build the audit digest for a window (default: the previous full UTC day) from ledger rows and entry/grant metadata, and return it. With send=true it is also sent to the owner on Telegram, at most once per window. Any remote caller is refused (tier 3).",
+      "OWNER ONLY (local stdio or the passkey console): build the audit digest for a window (default: the previous full UTC day) from ledger rows and entry/grant metadata, and return it. With send=true it is also sent to the owner on Telegram, at most once per window. Any remote caller is refused (tier 3).",
     inputSchema: schema({
       from: { type: "string", description: "Window start (inclusive): YYYY-MM-DD (UTC) or an ISO time with Z/offset." },
       to: { type: "string", description: "Window end (exclusive), same formats." },
       send: { type: "boolean", description: "Also send it on Telegram. Default false." },
     }),
+  },
+  {
+    name: "admin_delete_entry",
+    description:
+      "OWNER ONLY (local stdio or the passkey console): soft-delete an entry (status deleted; agents can no longer use it; the stored secret stays until admin_purge_entry). Metadata only. Any remote caller is refused (tier 3).",
+    inputSchema: schema({ entry_id: { type: "string" } }, ["entry_id"]),
+  },
+  {
+    name: "admin_request_reentry",
+    description:
+      "OWNER ONLY (local stdio or the passkey console): send the owner a single-use card link (Telegram) to re-type the secret of an existing entry. Returns the card id and expiry only. Any remote caller is refused (tier 3).",
+    inputSchema: schema(
+      { entry_id: { type: "string" }, reason: { type: "string", maxLength: 300, description: "Shown on the card. Default: requested from the owner console." } },
+      ["entry_id"],
+    ),
+  },
+  {
+    name: "admin_console_bootstrap",
+    description:
+      "LOCAL STDIO ONLY: mint the one-time owner-console enrollment code (15 minutes, single use, replaces any earlier code). It is returned ONCE in this result and stored only as a hash; type it on /console/enroll to register a passkey. Refused for every other identity, including an owner console session (tier 3).",
+    inputSchema: schema({}),
   },
   {
     name: "credential_rotate",
@@ -1184,6 +1212,7 @@ async function entryUsePlan(a: Record<string, unknown>, env: Env): Promise<Plan>
 // ---------------------------------------------------------------------------
 
 const GITHUB_DEFAULT_REF = "vault://github/echoomegaprime";
+const BOOTSTRAP_CAPABILITY = "vault.admin.console.bootstrap";
 
 const PLANNERS: Readonly<Record<string, Planner>> = Object.freeze({
   vault_status: (_a, env) => ({
@@ -1774,6 +1803,73 @@ const PLANNERS: Readonly<Record<string, Planner>> = Object.freeze({
       },
     };
   },
+  admin_delete_entry: (a, env) => {
+    const entryId = reqStr(a, "entry_id");
+    return {
+      capability: "vault.admin.entries.delete",
+      resource: clip(`vault:entry/${sanitizeDisplayText(entryId, 40)}`, MAX_RESOURCE),
+      params: { entry_id: entryId },
+      summary: `Soft-delete ${clip(entryId, 40)}`,
+      run: async () => {
+        try {
+          return { result: { ok: true, data: { entry: await deleteEntry(entryId, env.deps.cards) } } };
+        } catch (err) {
+          return { result: entryFailure(err) };
+        }
+      },
+    };
+  },
+  admin_request_reentry: (a, env) => {
+    const entryId = reqStr(a, "entry_id");
+    const reason = optStr(a, "reason") ?? "Re-entry requested from the owner console";
+    return {
+      capability: "vault.admin.entries.reentry",
+      resource: clip(`vault:entry/${sanitizeDisplayText(entryId, 40)}`, MAX_RESOURCE),
+      params: { entry_id: entryId, reason },
+      summary: `Send a re-entry card for ${clip(entryId, 40)}`,
+      run: async () => {
+        try {
+          const entry = await getEntryMetadata(entryId, env.deps.cards);
+          if (!entry || entry.status === "deleted") return { result: { ok: false, error: "entry_not_found" } };
+          // The gateway writes the one ledger row for this call.
+          const receipt = await requestCard(
+            { client: env.identity, site: entry.site, kind: entry.kind, reason, entry_id: entry.id },
+            { ...env.deps.cards, ledger: async () => undefined },
+          );
+          return { result: { ok: true, data: receipt } };
+        } catch (err) {
+          return { result: entryFailure(err) };
+        }
+      },
+    };
+  },
+  // The first-passkey enrollment code. Local stdio ONLY: dispatchTool keeps this
+  // capability out of the owner-session carve-out, and mintBootstrapCode checks again.
+  admin_console_bootstrap: (_a, env) => ({
+    capability: BOOTSTRAP_CAPABILITY,
+    resource: "vault:console/bootstrap",
+    params: {},
+    summary: "Mint the owner-console enrollment code",
+    run: async () => {
+      try {
+        const minted = await mintBootstrapCode(env.identity, { ...(env.deps.now ? { now: env.deps.now } : {}), ...env.deps.console });
+        return {
+          result: {
+            ok: true,
+            data: {
+              bootstrap_code: minted.code,
+              expires_at: minted.expires_at,
+              ttl_seconds: minted.ttl_seconds,
+              next: "Open /console/enroll on the console origin, type this code and register a passkey. Single use; minting again replaces it.",
+            },
+          },
+        };
+      } catch (err) {
+        const code = err instanceof Error && err.message === "local_only" ? "tier3_human_only" : "internal_error";
+        return { result: { ok: false, error: code } };
+      }
+    },
+  }),
   credential_rotate: (a) => tier3Plan("vault.secret.rotate", a),
   credential_revoke: (a) => tier3Plan("vault.secret.delete", a),
 });
@@ -1815,7 +1911,10 @@ function validIdentity(identity: unknown): identity is ClientIdentity {
     typeof i.client_id === "string" &&
     i.client_id.length > 0 &&
     i.client_id.length <= 200 &&
-    (i.kind === "oauth" || i.kind === "local" || i.kind === "workload") &&
+    // "owner" only for the very object owner-console.ts minted; "owner:" ids only for that kind.
+    (i.kind === "owner"
+      ? isMintedOwnerIdentity(i) && OWNER_CLIENT_ID_PATTERN.test(i.client_id)
+      : (i.kind === "oauth" || i.kind === "local" || i.kind === "workload") && !i.client_id.startsWith("owner:")) &&
     Array.isArray(i.scopes) &&
     i.scopes.every((s) => typeof s === "string")
   );
@@ -1921,13 +2020,21 @@ export async function dispatchTool(
     // "rate_limit_unavailable" when the store is unreachable (fail closed).
     decision = await enforceRateLimits(request, decision, deps.rules, deps.policy);
     // Owner-only admin surface: vault.admin.* is tier 3, so evaluatePolicy denies
-    // it for EVERY client. The one exception is the local stdio identity — the
-    // owner on their own machine — which we allow here. This carve-out is keyed
-    // solely on kind==="local"; it never loosens the tier-3 deny that every remote
+    // it for EVERY client. Two identities are let through here, and only these:
+    //   - kind "local": the stdio process on the owner's own machine;
+    //   - kind "owner": a passkey console session. validIdentity (above) accepts
+    //     that kind only for an object minted by owner-console.ts after it
+    //     matched a session token; step-up for destructive tools is enforced
+    //     there, before the call reaches this function.
+    // The console bootstrap code stays local-only: an owner session cannot mint
+    // the code that enrolls a passkey. The carve-out is keyed solely on those
+    // two kinds; it never loosens the tier-3 deny that every remote
     // OAuth/workload agent still receives above.
-    if (plan.capability.startsWith("vault.admin.") && decision.decision === "deny" && identity.kind === "local") {
-      log.warn("vault_admin_local_allow", { capability: plan.capability, client_id: identity.client_id });
-      decision = { decision: "allow", tier: decision.tier, reason: "owner_local" };
+    const adminIdentity =
+      identity.kind === "local" || (identity.kind === "owner" && plan.capability !== BOOTSTRAP_CAPABILITY);
+    if (plan.capability.startsWith("vault.admin.") && decision.decision === "deny" && adminIdentity) {
+      log.warn("vault_admin_owner_allow", { capability: plan.capability, client_id: identity.client_id, kind: identity.kind });
+      decision = { decision: "allow", tier: decision.tier, reason: identity.kind === "local" ? "owner_local" : "owner_console" };
     }
     const row = {
       ...base,

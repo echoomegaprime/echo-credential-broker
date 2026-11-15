@@ -6,7 +6,20 @@ Work top to bottom. Nothing here needs a secret pasted into a chat.
 
 - [ ] Create a Postgres database and set `DATABASE_URL`.
       The deployed server needs it: without it the built server has no working database, and OAuth, approvals, cards and the ledger fail.
-- [ ] `npm run build` applies `migrations/*.sql` (0002 OAuth, 0003 ledger, 0004 approvals, 0005 entries + cards, 0006 entry grants). To apply them on their own: `npm run db:migrate`.
+- [ ] `npm run build` applies `migrations/*.sql`. To apply them on their own: `npm run db:migrate`.
+
+  | Migration | What it adds |
+  | --- | --- |
+  | 0002 | OAuth clients, pending authorizations, tokens |
+  | 0003 | Hash-chained ledger |
+  | 0004 | Approvals |
+  | 0005 | Entries and cards |
+  | 0006 | Entry consent grants |
+  | 0007 | Entry rotation state ([ops/rotation-and-delete.md](./ops/rotation-and-delete.md)) |
+  | 0008 | Ledger anchor index ([ops/ledger-anchor.md](./ops/ledger-anchor.md)) |
+  | 0009 | Digest sent-window state ([ops/daily-digest.md](./ops/daily-digest.md)) |
+  | 0010 | Shared rate-limit state ([ops/rate-limits.md](./ops/rate-limits.md)) |
+  | 0011 | Owner console: passkeys, challenges, sessions, bootstrap code ([ops/owner-console.md](./ops/owner-console.md)) |
 
 ## 2. Telegram bot
 
@@ -23,7 +36,10 @@ Work top to bottom. Nothing here needs a secret pasted into a chat.
 - [ ] `ECHO_VAULT_PUBLIC_URL` = the public https origin, no path (for example `https://credbroker.echo-op.com`).
 - [ ] `ECHO_SDK_API_KEY` (and `ECHO_SDK_GATE_URL` if not the default) so the broker can reach the canonical vault.
 - [ ] `ECHO_VAULT_LEDGER_HMAC_KEY` (32+ characters). Set it before the first request; keep it out of the database.
-- [ ] Leave `ECHO_VAULT_CONSOLE` unset on a public host.
+- [ ] `ECHO_VAULT_ANCHOR_KEY` (32+ characters) so ledger anchors are signed. Keep it out of the database.
+- [ ] Leave `ECHO_VAULT_CONSOLE` (the legacy read-only page) unset on a public host.
+- [ ] Owner console: `ECHO_VAULT_CONSOLE_ORIGIN` = the exact https origin the owner will open (for example `https://credbroker.echo-op.com`). Its hostname becomes the passkey RP ID, so choose it once. Leave it unset to keep `/console` off (503). Never set `ECHO_VAULT_CONSOLE_ALLOW_LOCALHOST` on a deployed server.
+- [ ] Optional: `ECHO_VAULT_DIGEST_DENIAL_BURST` (default 10).
 - [ ] Optional: `ECHO_VAULT_POLICY_FILE`, `ECHO_VAULT_WORKLOAD_TOKENS_FILE`, the `ECHO_VAULT_GITHUB_*` variables. See `.env.example`.
 - [ ] Optional consent-grant tuning: `ECHO_VAULT_GRANT_TTL_MS` (grant lifetime, default `86400000` = 24 h) and `ECHO_VAULT_GRANT_MAX_USES` (un-prompted reads per grant, default `500`; `unlimited` for no cap).
 - [ ] Deploy (`npm run build`, then start the server the way your host does).
@@ -54,7 +70,27 @@ Work top to bottom. Nothing here needs a secret pasted into a chat.
 - [ ] Ask the client to request a card (`entry_request_card`). Open the link from Telegram, type the secret, then have the client call `entry_use`. Approve the first use on Telegram.
 - [ ] Call `audit_verify` (needs `audit.read`) → `ok: true`.
 
-## 7. Server-side services (optional)
+## 7. Owner console
+
+Full procedure: [ops/owner-console.md](./ops/owner-console.md).
+
+- [ ] `curl -i https://YOUR-HOST/console/login` → `200` with a `Content-Security-Policy` header (a `503` means `ECHO_VAULT_CONSOLE_ORIGIN` is unset or malformed).
+- [ ] On the vault host, over local stdio, call `admin_console_bootstrap`. The code in the result is valid for 15 minutes, once.
+- [ ] Open `https://YOUR-HOST/console/enroll`, type the code and register a passkey. Sign in at `/console/login`.
+- [ ] Add a second passkey on another device (Security page).
+- [ ] If a proxy sits in front of the server, add a per-address rate limit for `/console/login/*` and `/console/enroll/*` there.
+
+## 8. Scheduled runners
+
+Each prints one JSON object and exits non-zero on failure. They need the same database and Telegram variables as the server.
+
+- [ ] `npm run vault:anchor` hourly — [ops/ledger-anchor.md](./ops/ledger-anchor.md)
+- [ ] `npm run vault:digest` daily — [ops/daily-digest.md](./ops/daily-digest.md)
+- [ ] `npm run vault:rotate-due` daily — [ops/rotation-and-delete.md](./ops/rotation-and-delete.md)
+
+Background reading: [ops/rate-limits.md](./ops/rate-limits.md), [ops/dns-pinning.md](./ops/dns-pinning.md), [ops/test-coverage.md](./ops/test-coverage.md).
+
+## 9. Server-side services (optional)
 
 - [ ] For each service, generate a token `ewk_` + 43 or more URL-safe characters. Give the token to the service only.
 - [ ] Put its SHA-256 in the file named by `ECHO_VAULT_WORKLOAD_TOKENS_FILE`:
@@ -64,6 +100,7 @@ Work top to bottom. Nothing here needs a secret pasted into a chat.
 
 ## Day two
 
-- From the **stdio transport (owner only)**, the admin tools manage this live: `admin_list_clients`, `admin_set_client_scopes`, `admin_revoke_client`, `admin_list_grants`, `admin_revoke_grant`, `admin_list_entries`. They are tier 3 and refused for every remote client, and are fully ledgered under `local:<name>`.
+- The **owner console** (`/console`, passkey sign-in) manages clients, grants, entries, the ledger and the digest. Its actions are ledgered under `owner:<id>`.
+- From the **stdio transport (owner only)**, the same admin tools work as before: `admin_list_clients`, `admin_set_client_scopes`, `admin_revoke_client`, `admin_list_grants`, `admin_revoke_grant`, `admin_list_entries` and the rotation, anchor and digest tools. They are tier 3 and refused for every OAuth and workload client, and are fully ledgered under `local:<name>`. Stdio is also the break-glass path when every passkey is lost.
 - The same operations are also plain functions: `revokeClient(client_id)` / `setClientScopes` (`src/lib/vault/v2/identity.ts`), and `revokeEntryGrant(client_id, entry_id, store?, host?, path_prefix?)` / `listEntryGrants` (`src/lib/vault/v2/entry-grants.ts`). A consent grant is now scoped to one host + path and expires; `admin_revoke_grant` (or `revokeEntryGrant`) with `host`/`path_prefix` removes one narrow grant, or all grants for the pair when omitted.
-- There is no remote owner UI for these yet.
+- The remote owner UI is the console above; there is no other one.

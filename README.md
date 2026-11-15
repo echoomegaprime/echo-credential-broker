@@ -23,7 +23,7 @@ There is no self-asserted caller any more: `x-echo-agent` and similar headers ar
 | 0 | Read | Runs if the client holds the scope | `vault_list`, `github_get_file`, `entry_list`, `audit_list`, GET via `provider_request` |
 | 1 | Reversible write, in scope | Runs if the client holds the scope | `github_create_branch`, file write on an `agent/*` branch, `github_create_draft_pr`, `entry_request_card` |
 | 2 | Hard to undo, or unknown | `approval_required` → owner approves that exact request on Telegram → call again with `approval_id` (single use, 10 minutes) | `github_repo_transfer`, file write on any other branch, any non-GET via `provider_request` / `credential_use` / `entry_use` |
-| 3 | Human only | Always refused (admin tools: allowed only for the local stdio owner) | reveal / rotate / revoke a secret, Stripe writes, any `get_secret`-like tool name, the `admin_*` tools for any remote client |
+| 3 | Human only | Always refused (admin tools: allowed only for the owner — the local stdio process or a passkey console session) | reveal / rotate / revoke a secret, Stripe writes, any `get_secret`-like tool name, the `admin_*` tools for any remote client |
 
 Scopes are `<namespace>.<read|write>`: `github.*`, `cloudflare.*`, `openai.*`, `xai.*`, `stripe.read`, `vault.read`, `vault.write`, `audit.read`. No scope implies another. The owner can tighten policy per client with `ECHO_VAULT_POLICY_FILE` (rules can only make things stricter).
 
@@ -39,7 +39,25 @@ A site can have several accounts (for example `github.com — echoomegaprime` an
    - `api_key` / `oauth_token` entries are sent as a bearer token; `password` entries as HTTP Basic with the account name. There is no form login, cookie session or 2FA handling.
    - A **401** from the site flags that one entry for re-entry (`site_rejected_credential`); request a new card with its `entry_id`. A **403** returns `site_forbidden` and leaves the entry active (it is a scope/rate problem, not a bad credential).
 
-The owner, on the stdio transport only, has admin tools: `admin_list_clients`, `admin_set_client_scopes`, `admin_revoke_client`, `admin_list_grants`, `admin_revoke_grant`, `admin_list_entries`. Every remote client is refused (tier 3).
+The owner has admin tools: `admin_list_clients`, `admin_set_client_scopes`, `admin_revoke_client`, `admin_list_grants`, `admin_revoke_grant`, `admin_list_entries`, `admin_set_rotation`, `admin_rotate_entry`, `admin_rotation_due`, `admin_delete_entry`, `admin_request_reentry`, `admin_purge_entry`, `admin_anchor_now`, `admin_verify_anchor`, `admin_digest_now`. They run for two identities only: the local stdio process and a passkey session of the owner console. Every OAuth and workload client is refused (tier 3).
+
+## Owner console
+
+`/console` is a passkey-gated web console for the owner: clients, consent grants, entries (rotation, re-entry card, soft delete, purge), the audit ledger (verify, anchor), the digest, and passkeys and sessions. It is off until `ECHO_VAULT_CONSOLE_ORIGIN` is set. The first passkey is enrolled with a one-time code minted over local stdio (`admin_console_bootstrap`); destructive actions need a fresh passkey confirmation. It never shows, copies or exports a stored secret. Procedure, rules and threat model: [docs/ops/owner-console.md](./docs/ops/owner-console.md).
+
+## Operations
+
+| Topic | Page | Runner |
+| --- | --- | --- |
+| Owner console (passkeys, bootstrap, recovery) | [docs/ops/owner-console.md](./docs/ops/owner-console.md) | — |
+| Rotation policies, auto-rotation, soft delete and purge | [docs/ops/rotation-and-delete.md](./docs/ops/rotation-and-delete.md) | `npm run vault:rotate-due` |
+| Ledger anchoring to Telegram (detects truncation and rewrites) | [docs/ops/ledger-anchor.md](./docs/ops/ledger-anchor.md) | `npm run vault:anchor` |
+| Daily audit digest | [docs/ops/daily-digest.md](./docs/ops/daily-digest.md) | `npm run vault:digest` |
+| Shared, durable rate limits | [docs/ops/rate-limits.md](./docs/ops/rate-limits.md) | — |
+| DNS pinning for `entry_use` | [docs/ops/dns-pinning.md](./docs/ops/dns-pinning.md) | — |
+| Tool test coverage and opt-in live tests | [docs/ops/test-coverage.md](./docs/ops/test-coverage.md) | — |
+
+Pass runner arguments after `--`, for example `npm run vault:digest -- --from 2026-11-13`.
 
 ## Connect a client (remote, OAuth)
 
@@ -78,6 +96,10 @@ The stdio process is trusted as far as the OS user who started it. Its scopes co
 | `ECHO_VAULT_APPROVAL_HMAC_KEY` | approvals | ≥ 32 chars; signs the Approve / Deny buttons |
 | `ECHO_VAULT_TELEGRAM_WEBHOOK_SECRET` | approvals | Secret Telegram echoes on every webhook call |
 | `ECHO_VAULT_LEDGER_HMAC_KEY` | recommended | ≥ 32 chars; set before the first ledger row |
+| `ECHO_VAULT_ANCHOR_KEY` | recommended | ≥ 32 chars; HMAC key for ledger anchor lines (unset: anchors are sent unsigned) |
+| `ECHO_VAULT_DIGEST_DENIAL_BURST` | optional | Denials by one client in a digest window that count as a burst (default `10`) |
+| `ECHO_VAULT_CONSOLE_ORIGIN` | owner console | Exact https origin of the console; also the WebAuthn origin and RP ID. Unset: `/console` answers 503 |
+| `ECHO_VAULT_CONSOLE_ALLOW_LOCALHOST` | development | `1` allows an `http://localhost:<port>` console origin |
 | `ECHO_VAULT_GRANT_TTL_MS` | optional | Lifetime of an entry consent grant in ms (default `86400000` = 24 h) |
 | `ECHO_VAULT_GRANT_MAX_USES` | optional | Max un-prompted reads per consent grant (default `500`; `unlimited` for no cap) |
 | `ECHO_VAULT_POLICY_FILE` | optional | JSON rules per client (allowlists, rate limits, raised tiers) |
@@ -86,8 +108,9 @@ The stdio process is trusted as far as the OS user who started it. Its scopes co
 | `ECHO_AGENT` | stdio | Name of the local client in the ledger (`local:<name>`); grants nothing |
 | `ECHO_VAULT_GITHUB_APP_ID_REF`, `ECHO_VAULT_GITHUB_APP_KEY_REF`, `ECHO_VAULT_GITHUB_INSTALLATIONS` | optional | GitHub App for short-lived installation tokens |
 | `ECHO_VAULT_OAUTH_MAX_CLIENTS`, `ECHO_VAULT_OAUTH_MAX_PENDING` | optional | Registration limits |
-| `ECHO_VAULT_CONSOLE` | optional | `local` enables the read-only web console. Only on a private host |
+| `ECHO_VAULT_CONSOLE` | optional | `local` enables the legacy read-only page at `/` (no login, read scopes, no admin tools). Only on a private host |
 | `ECHO_VAULT_MIGRATIONS_DIR`, `ECHO_VAULT_DEBUG` | optional | Migrations path override; debug logging |
+| `ECHO_VAULT_LIVE_TESTS`, `ECHO_VAULT_LIVE_GITHUB`, `ECHO_VAULT_LIVE_CLOUDFLARE`, `ECHO_VAULT_LIVE_OPENAI`, `ECHO_VAULT_LIVE_XAI`, `ECHO_VAULT_LIVE_STRIPE`, `ECHO_VAULT_LIVE_<PROVIDER>_REF`, `ECHO_VAULT_LIVE_CLOUDFLARE_ZONE_ID` | tests only | Opt-ins for the live provider tests ([docs/ops/test-coverage.md](./docs/ops/test-coverage.md)) |
 
 Deployment checklist: [docs/DEPLOY.md](./docs/DEPLOY.md). Client setup: [docs/INSTALL.md](./docs/INSTALL.md). Security rules: [SECURITY.md](./SECURITY.md).
 
