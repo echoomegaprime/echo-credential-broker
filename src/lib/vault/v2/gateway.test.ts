@@ -25,6 +25,7 @@ import { InstallationTokenCache } from "./github-app.ts";
 import { handleMcpGet, handleMcpPost, handleRestTool } from "./http-transport.ts";
 import { Ledger, MemoryLedgerStore } from "./ledger.ts";
 import { MemoryOAuthStore } from "./oauth-store.ts";
+import { PinnedFetchError, type PinnedFetch } from "./pinned-fetch.ts";
 import {
   configureOAuth,
   handleAuthorize,
@@ -692,6 +693,134 @@ describe("host blocking used by entry_use", () => {
       assert.equal(isBlockedHost(host), false, host);
     }
     assert.equal(isPrivateOrLinkLocalIp("fdic.gov"), false);
+  });
+});
+
+describe("entry_use: DNS pinning (resolve once, connect only to what was validated)", () => {
+  const PUBLIC_IP = "140.82.112.5";
+  const SECRET = "PIN-rebind-secret-7c1e55a0f3b24d19";
+  const who = client("oc_pin", ["vault.read", "vault.write"]);
+  const use = { site: "pin.example", account: "acct", method: "GET", host: "pin.example", url_path: "/v1/me", task: "read my profile" };
+
+  before(() => {
+    secretsToScan.add(SECRET);
+  });
+
+  /** A world whose entry_use goes down the PRODUCTION branch (no deps.fetch), with the pinned transport and the resolver observed. */
+  async function pinWorld(resolve: (call: number) => string[]) {
+    const w = makeWorld();
+    await seedEntry(w, who, { site: "pin.example", account: "acct", kind: "api_key", secret: SECRET });
+    const resolverCalls: string[] = [];
+    const resolveHost = async (host: string) => {
+      resolverCalls.push(host);
+      return resolve(resolverCalls.length);
+    };
+    const sent: Array<{ url: string; addresses: string[]; auth: string; hasTestOnly: boolean; timeoutMs?: number; maxResponseBytes?: number }> = [];
+    const pinned: PinnedFetch = async (url, init, options) => {
+      const auth = new Headers(init.headers).get("authorization") ?? "";
+      sent.push({
+        url: String(url),
+        addresses: [...options.addresses],
+        auth,
+        hasTestOnly: options.testOnly !== undefined,
+        timeoutMs: options.timeoutMs,
+        maxResponseBytes: options.maxResponseBytes,
+      });
+      options.onConnect?.(options.addresses[0]);
+      // The site echoes the credential back, as hostile sites do.
+      return new Response(JSON.stringify({ ok: true, you_sent: auth }), { status: 200, headers: { "content-type": "application/json" } });
+    };
+    // Any use of the global fetch from here on is a bug: count it, never let it out.
+    const realFetch = globalThis.fetch;
+    let globalFetchCalls = 0;
+    globalThis.fetch = (async () => {
+      globalFetchCalls += 1;
+      throw new Error("global fetch must not be used by entry_use");
+    }) as typeof fetch;
+    const deps: GatewayDeps = { ...w.deps, fetch: undefined, resolveHost, pinnedFetch: pinned };
+    return { w, deps, resolveHost, resolverCalls, sent, globalFetchCalls: () => globalFetchCalls, restore: () => void (globalThis.fetch = realFetch) };
+  }
+
+  it("a rebinding resolver (public first, 127.0.0.1 afterwards) cannot move the request: one lookup, pinned to the validated address", async () => {
+    const p = await pinWorld((call) => (call === 1 ? [PUBLIC_IP] : ["127.0.0.1"]));
+    try {
+      const ask = expectFail(await callWith(who, "entry_use", use, p.deps), "approval_required");
+      assert.equal(p.resolverCalls.length, 0, "nothing is resolved before consent");
+      await p.w.tap(String(ask.approval_id), "Approve");
+
+      const first = expectOk(await callWith(who, "entry_use", { ...use, approval_id: ask.approval_id }, p.deps));
+      assert.equal(first.status, 200);
+      assert.deepEqual(p.resolverCalls, ["pin.example"], "the resolver is called exactly once for the request");
+      assert.equal(p.sent.length, 1);
+      assert.equal(p.sent[0].url, "https://pin.example/v1/me");
+      assert.deepEqual(p.sent[0].addresses, [PUBLIC_IP], "the transport is pinned to the address that was validated");
+      assert.equal(p.sent[0].auth, `Bearer ${SECRET}`, "the credential went to the pinned transport");
+      assert.equal(p.sent[0].hasTestOnly, false, "production never passes the test-only relaxations");
+      assert.equal(p.sent[0].timeoutMs, 12_000);
+      assert.equal(p.sent[0].maxResponseBytes, 1024 * 1024);
+      // The echoed credential is redacted on the way out.
+      assert.match(JSON.stringify(first), /REDACTED/);
+      scan("pinned entry_use result", first);
+      assert.ok(captured.some((line) => line.includes("vault_entry_use_connected") && line.includes(PUBLIC_IP)), "the connected address is logged");
+
+      // What a second lookup (the one global fetch used to make) would have got:
+      assert.deepEqual(await p.resolveHost("pin.example"), ["127.0.0.1"]);
+      assert.equal(p.sent.length, 1, "…and it changed nothing: no transport call was ever aimed at it");
+
+      // The next request resolves once more, sees the rebound answer and sends nothing.
+      const rebound = expectFail(await callWith(who, "entry_use", { ...use, task: "second read" }, p.deps), "entry_use_failed");
+      assert.match(String(rebound.detail), /hostname_not_allowed/);
+      assert.equal(p.resolverCalls.length, 3, "exactly one more lookup for the second request");
+      assert.equal(p.sent.length, 1, "nothing was sent to the rebound address");
+      scan("rebound entry_use result", rebound);
+      assert.equal(p.globalFetchCalls(), 0, "the default path never touches global fetch");
+    } finally {
+      p.restore();
+    }
+  });
+
+  it("one private answer among public ones rejects the whole request; nothing is sent", async () => {
+    for (const answer of [
+      [PUBLIC_IP, "10.0.0.5"],
+      ["169.254.169.254", PUBLIC_IP],
+      [PUBLIC_IP, "::ffff:127.0.0.1"],
+      [PUBLIC_IP, "64:ff9b::a9fe:a9fe"],
+      [PUBLIC_IP, "0:0:0:0:0:0:0:1"],
+      [PUBLIC_IP, "pin.example"], // a resolver must answer with addresses, not names
+      [],
+    ]) {
+      const p = await pinWorld(() => answer);
+      try {
+        const ask = expectFail(await callWith(who, "entry_use", use, p.deps), "approval_required");
+        await p.w.tap(String(ask.approval_id), "Approve");
+        const res = expectFail(await callWith(who, "entry_use", { ...use, approval_id: ask.approval_id }, p.deps), "entry_use_failed");
+        assert.match(String(res.detail), answer.length === 0 ? /dns_lookup_failed/ : /hostname_not_allowed/, JSON.stringify(answer));
+        assert.equal(p.resolverCalls.length, 1);
+        assert.equal(p.sent.length, 0, `nothing sent for ${JSON.stringify(answer)}`);
+        assert.equal(p.globalFetchCalls(), 0);
+        scan("mixed-answer entry_use result", res);
+      } finally {
+        p.restore();
+      }
+    }
+  });
+
+  it("every validated address is handed to the transport, de-duplicated, and a transport refusal surfaces without the secret", async () => {
+    const p = await pinWorld(() => [PUBLIC_IP, "2606:4700::1111", PUBLIC_IP]);
+    try {
+      const ask = expectFail(await callWith(who, "entry_use", use, p.deps), "approval_required");
+      await p.w.tap(String(ask.approval_id), "Approve");
+      expectOk(await callWith(who, "entry_use", { ...use, approval_id: ask.approval_id }, p.deps));
+      assert.deepEqual(p.sent[0].addresses, [PUBLIC_IP, "2606:4700::1111"]);
+
+      // The real transport's fail-closed error (socket connected outside the pinned set).
+      const refusing: GatewayDeps = { ...p.deps, pinnedFetch: async () => Promise.reject(new PinnedFetchError("hostname_not_allowed")) };
+      const res = expectFail(await callWith(who, "entry_use", { ...use, task: "transport refuses" }, refusing), "entry_use_failed");
+      assert.match(String(res.detail), /hostname_not_allowed/);
+      scan("transport-refused entry_use result", res);
+    } finally {
+      p.restore();
+    }
   });
 });
 
