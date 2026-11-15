@@ -24,6 +24,7 @@ import type { ClientIdentity } from "./contracts.ts";
 import { MemoryDigestStateStore } from "./digest.ts";
 import { MemoryEntryGrantStore } from "./entry-grants.ts";
 import { dispatchTool, TOOL_DEFINITIONS, type GatewayDeps, type GatewayResult } from "./gateway.ts";
+import { MemoryInjectorStore, MemoryInjectTicketStore } from "./injector.ts";
 import { authenticateHttp, handleMcpPost, handleRestTool } from "./http-transport.ts";
 import { authenticateRequest, localIdentity } from "./identity.ts";
 import { Ledger, MemoryLedgerStore } from "./ledger.ts";
@@ -308,6 +309,7 @@ function makeWorld(opts: { store?: OwnerConsoleStore; rateLimits?: RateLimitStor
   const env = opts.env ?? ENV;
   const cards: CardsDeps = { entries, cards: new MemoryCardStore(), backend, ledger: (i) => ledger.append(i), fetch: telegramFetch, env };
   const store = opts.store ?? new MemoryOwnerConsoleStore();
+  const injectors = new MemoryInjectorStore();
   const rateLimits = opts.rateLimits ?? new MemoryRateLimitStore();
   const gateway: GatewayDeps = {
     ledger: (i) => ledger.append(i),
@@ -324,6 +326,7 @@ function makeWorld(opts: { store?: OwnerConsoleStore; rateLimits?: RateLimitStor
     resolveHost: async () => ["140.82.112.5"],
     digest: { ledger, state: new MemoryDigestStateStore(), fetch: telegramFetch, env },
     console: { store, now: () => clock },
+    injector: { injectors, tickets: new MemoryInjectTicketStore(), now: () => clock },
   };
   const deps: ConsoleDeps = { env, now: () => clock, store, rateLimits, gateway };
 
@@ -441,6 +444,7 @@ function makeWorld(opts: { store?: OwnerConsoleStore; rateLimits?: RateLimitStor
     enroll,
     login,
     stepUp,
+    injectors,
     post,
     seedEntry,
     advance: (ms: number) => {
@@ -1100,6 +1104,12 @@ describe("step-up", () => {
 // Identity + authorization
 // ---------------------------------------------------------------------------
 
+/** A real P-256 public key (the private half is discarded). */
+const INJECTOR_JWK = (() => {
+  const { x, y } = generateKeyPairSync("ec", { namedCurve: "P-256" }).publicKey.export({ format: "jwk" });
+  return { kty: "EC", crv: "P-256", x, y };
+})();
+
 describe("the owner identity", () => {
   const ADMIN_CALLS: Array<[string, Record<string, unknown>]> = [
     ["admin_list_clients", {}],
@@ -1118,6 +1128,9 @@ describe("the owner identity", () => {
     ["admin_verify_anchor", { line: `ECHO-VAULT-ANCHOR v1 seq=1 hash=${"0".repeat(64)} rows=1 at=2026-11-14T10:00:00.000Z unsigned` }],
     ["admin_digest_now", {}],
     ["admin_console_bootstrap", {}],
+    ["admin_enroll_injector", { name: "test browser", public_key_jwk: INJECTOR_JWK }],
+    ["admin_list_injectors", {}],
+    ["admin_revoke_injector", { injector_id: "inj_0000000000000000" }],
   ];
 
   it("covers every admin_* tool the gateway defines", () => {
@@ -1771,7 +1784,7 @@ describe("migration 0011 on PGlite", () => {
     const dir = new URL("../../../../migrations/", import.meta.url);
     const files = readdirSync(dir).filter((f) => f.endsWith(".sql")).sort();
     assert.equal(files.filter((f) => f <= "0011_vault_owner_console.sql").at(-1), "0011_vault_owner_console.sql");
-    assert.equal(files.at(-1), "0012_vault_cookie_entries.sql");
+    assert.equal(files.at(-1), "0013_vault_injectors.sql");
     assert.equal(files.filter((f) => f.startsWith("0011_")).length, 1);
     const { PGlite } = await import("@electric-sql/pglite");
     const all = new PGlite();
@@ -1803,5 +1816,60 @@ describe("migration 0011 on PGlite", () => {
     assert.equal((await w.post(l, "/console/logout")).status, 303);
     assert.equal((await w.send("GET", "/console", { cookie: l.cookie })).status, 303);
     assert.equal(mintOwnerIdentity(auth.id).client_id, ownerClientId(auth.id));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Security page: browser injectors (injector.ts)
+// ---------------------------------------------------------------------------
+
+describe("console: injectors on the Security page", () => {
+  it("enroll needs a fresh step-up, shows the token once (no-store), lists hashes-free metadata, and revokes", async () => {
+    const { w, auth, l } = await ready();
+    const form = { name: "desk <b>chrome</b>", public_key_jwk: JSON.stringify(INJECTOR_JWK) };
+
+    // Stale step-up: refused, nothing enrolled.
+    w.advance(STEP_UP_MS + 1);
+    const stale = await w.post(l, "/console/security/injectors/enroll", form);
+    assert.equal(stale.status, 403);
+    assert.equal(/ein_[A-Za-z0-9_-]{43}/.test(stale.text), false);
+    assert.equal((await w.injectors.list()).length, 0);
+
+    assert.equal((await w.stepUp(l, auth)).status, 200);
+    const done = await w.post(l, "/console/security/injectors/enroll", form);
+    assert.equal(done.status, 200, done.text.slice(0, 300));
+    assert.equal(done.headers.get("cache-control"), "no-store");
+    const token = /<code>(ein_[A-Za-z0-9_-]{43})<\/code>/.exec(done.text)?.[1] ?? "";
+    const id = /<code>(inj_[0-9a-f]{16})<\/code>/.exec(done.text)?.[1] ?? "";
+    assert.ok(token && id, "the result page shows the injector id and the token");
+    assert.ok(done.text.includes("desk &lt;b&gt;chrome&lt;/b&gt;"), "the name is escaped");
+
+    // Stored as a hash; a later page never shows the token again.
+    const [stored] = await w.injectors.list();
+    assert.equal(stored.token_sha256, sha256Hex(token));
+    assert.equal(JSON.stringify(stored).includes(token), false);
+    const page = await w.send("GET", "/console/security", { cookie: l.cookie });
+    assert.equal(page.status, 200);
+    assert.ok(page.text.includes(id) && page.text.includes("Injectors"));
+    assert.equal(page.text.includes(token), false);
+    assert.equal(page.text.includes(stored.token_sha256), false, "not even the token hash is rendered");
+    assert.equal(JSON.stringify(await w.rows()).includes(token), false, "the token is in no ledger row");
+
+    // A private JWK and a non-P-256 key are refused.
+    const priv = generateKeyPairSync("ec", { namedCurve: "P-256" }).privateKey.export({ format: "jwk" });
+    const withD = await w.post(l, "/console/security/injectors/enroll", { name: "x", public_key_jwk: JSON.stringify(priv) });
+    assert.equal(withD.status, 400);
+    assert.ok(withD.text.includes("private_key_not_allowed"));
+    assert.equal(withD.text.includes(String(priv.d)), false);
+    assert.equal((await w.injectors.list()).length, 1);
+
+    const revoked = await w.post(l, "/console/security/injectors/revoke", { injector_id: id });
+    assert.equal(revoked.status, 200);
+    assert.ok(/revoked/.test(revoked.text));
+    assert.notEqual((await w.injectors.list())[0].revoked_at, null);
+    const rows = await w.rows();
+    for (const cap of ["vault.admin.injector.enroll", "vault.admin.injector.list", "vault.admin.injector.revoke"]) {
+      assert.ok(rows.some((r) => r.capability === cap && r.result === "ok"), cap);
+    }
   });
 });

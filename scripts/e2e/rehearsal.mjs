@@ -22,9 +22,16 @@
  *                                             # to https://httpbin.org/cookies, which echoes the cookies it received —
  *                                             # the client must see them REDACTED. Same fail-closed rule when the
  *                                             # site is unreachable.
+ *   node scripts/e2e/rehearsal.mjs --inject   # the --cookie proof, plus the browser injector channel
+ *                                             # (docs/ops/injector-contract.md): a SCRIPTED injector (a P-256 key
+ *                                             # pair generated here; no extension, no browser) is enrolled over the
+ *                                             # local stdio path before the server starts, the client calls
+ *                                             # entry_inject, the owner stand-in approves that one request, and this
+ *                                             # script redeems the ticket over HTTP, opens the sealed blob and
+ *                                             # compares the cookie with what the owner typed on the card.
  */
 import { spawn } from "node:child_process";
-import { createHash, randomBytes, randomInt } from "node:crypto";
+import { createHash, randomBytes, randomInt, webcrypto } from "node:crypto";
 import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -39,11 +46,12 @@ const { values: flags } = parseArgs({
     keep: { type: "boolean", default: false },
     verbose: { type: "boolean", default: false },
     cookie: { type: "boolean", default: false },
+    inject: { type: "boolean", default: false },
     help: { type: "boolean", default: false },
   },
 });
 if (flags.help) {
-  process.stdout.write("usage: node scripts/e2e/rehearsal.mjs [--cookie] [--keep] [--verbose]\n");
+  process.stdout.write("usage: node scripts/e2e/rehearsal.mjs [--cookie | --inject] [--keep] [--verbose]\n");
   process.exit(0);
 }
 
@@ -51,7 +59,10 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, "..", "..");
 const SITE = "httpbin.org";
 /** --cookie: a `cookie` entry against /cookies (echoes received cookies). Default: an api_key entry against /bearer. */
-const COOKIE_MODE = flags.cookie;
+const COOKIE_MODE = flags.cookie || flags.inject;
+/** --inject: the cookie proof plus the injector channel (ticket → sealed blob → scripted injector). */
+const INJECT_MODE = flags.inject;
+const INJECT_ORIGIN = `https://${SITE}`;
 const KIND = COOKIE_MODE ? "cookie" : "api_key";
 const SITE_PATH = COOKIE_MODE ? "/cookies" : "/bearer";
 const COOKIE_NAME = "rehearsal_session";
@@ -229,10 +240,96 @@ function baseEnv() {
   return env;
 }
 
+// ---------------------------------------------------------------- scripted injector (--inject)
+
+/** What the extension does, from docs/ops/injector-contract.md alone. Nothing under src/ is imported. */
+const subtle = webcrypto.subtle;
+const injector = {
+  keys: null, // CryptoKeyPair; the private key is non-extractable
+  publicJwk: null,
+  id: null,
+  token: null,
+  /** Encodings of the token (and, later, of the derived key and shared secret) that must appear nowhere. */
+  needles: [],
+};
+
+async function injectorKeygen() {
+  injector.keys = await subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"]);
+  const jwk = await subtle.exportKey("jwk", injector.keys.publicKey);
+  injector.publicJwk = { kty: "EC", crv: "P-256", x: jwk.x, y: jwk.y };
+}
+
+/**
+ * Enroll over the LOCAL STDIO path (`npm run mcp`, the owner's own machine): the only identities that may enroll
+ * are local stdio and a passkey console session. Runs before the HTTP server starts, on the same data directory.
+ */
+function enrollOverStdio(env) {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, ["--experimental-strip-types", join(ROOT, "scripts", "mcp-stdio.ts")], {
+      cwd: ROOT,
+      env: { ...env, ECHO_AGENT: "owner", NODE_OPTIONS: "" },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const done = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve({ ...value, stderr });
+    };
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      done({ ok: false, error: "timeout" });
+    }, 90_000);
+    child.stderr.on("data", (d) => (stderr += d.toString("utf8")));
+    let payload = null;
+    let answered = false;
+    child.stdout.on("data", (d) => {
+      stdout += d.toString("utf8");
+      const nl = stdout.indexOf("\n");
+      if (nl === -1 || answered) return;
+      answered = true;
+      try {
+        payload = JSON.parse(stdout.slice(0, nl))?.result?.structuredContent ?? null;
+      } catch {
+        payload = null;
+      }
+      child.stdin.end(); // lets the process flush the embedded database and exit
+    });
+    child.once("error", () => done({ ok: false, error: "spawn_failed" }));
+    child.once("exit", (code) => {
+      clearTimeout(timer);
+      done(payload?.ok ? { ok: true, data: payload.data } : { ok: false, error: payload?.error ?? (answered ? "no_result" : `exited_${code}`) });
+    });
+    child.stdin.write(
+      `${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "admin_enroll_injector", arguments: { name: "rehearsal scripted injector", public_key_jwk: injector.publicJwk } } })}\n`,
+    );
+  });
+}
+
+/** ECDH → HKDF-SHA256(salt, "echo-vault-injector-v1") → AES-256-GCM(iv, aad). Throws on any mismatch. */
+async function openSealed(sealed, expect) {
+  const expectedAad = `eit:${createHash("sha256").update(expect.ticket, "utf8").digest("hex")}|${injector.id}|${expect.target_origin}|${expect.mode}`;
+  if (Buffer.from(sealed.aad, "base64url").toString("utf8") !== expectedAad) throw new Error("aad_mismatch");
+  const u8 = (s) => new Uint8Array(Buffer.from(s, "base64url"));
+  const epk = await subtle.importKey("jwk", { kty: "EC", crv: "P-256", x: sealed.epk.x, y: sealed.epk.y, ext: true }, { name: "ECDH", namedCurve: "P-256" }, false, []);
+  const z = new Uint8Array(await subtle.deriveBits({ name: "ECDH", public: epk }, injector.keys.privateKey, 256));
+  const ikm = await subtle.importKey("raw", z, "HKDF", false, ["deriveKey", "deriveBits"]);
+  const hkdf = { name: "HKDF", hash: "SHA-256", salt: u8(sealed.salt), info: new TextEncoder().encode("echo-vault-injector-v1") };
+  const key = await subtle.deriveKey(hkdf, ikm, { name: "AES-GCM", length: 256 }, false, ["decrypt"]);
+  const plain = await subtle.decrypt({ name: "AES-GCM", iv: u8(sealed.iv), additionalData: u8(sealed.aad), tagLength: 128 }, key, u8(sealed.ct));
+  // For the leak search only: the derived key and the shared secret as bytes.
+  const k = Buffer.from(await subtle.deriveBits(hkdf, ikm, 256));
+  for (const bytes of [k, Buffer.from(z)]) for (const enc of ["hex", "base64", "base64url"]) injector.needles.push(bytes.toString(enc));
+  return JSON.parse(new TextDecoder().decode(plain));
+}
+
 // ---------------------------------------------------------------- main
 
 async function main() {
   out("ECHO Vault v2 rehearsal — real server, fake canonical vault, fake Telegram, scripted owner");
+  if (INJECT_MODE) out(`mode: --inject — the cookie proof below, then the injector channel: entry_inject → ticket → sealed blob → SCRIPTED injector (no extension, no browser)`);
   out(COOKIE_MODE ? `mode: cookie entry (--cookie) — the owner pastes a Cookie header; target GET https://${SITE}${SITE_PATH}` : `mode: api_key entry — target GET https://${SITE}${SITE_PATH}`);
   out("");
 
@@ -285,6 +382,24 @@ async function main() {
     ECHO_E2E_FAKE_TELEGRAM_URL: telegram.url,
     NODE_OPTIONS: `--import=${pathToFileURL(join(HERE, "telegram-preload.mjs")).href}`,
   };
+  // -- --inject: enroll the scripted injector over local stdio, before the HTTP server owns the database
+  const inject = { enroll: null, redeem: null, plain: null, replay: null, mcpWithToken: null, restWithToken: null, report: null, tamper: null, redeemBodyText: "", error: null };
+  if (INJECT_MODE) {
+    await injectorKeygen();
+    inject.enroll = await enrollOverStdio(serverEnv);
+    if (inject.enroll.ok) {
+      injector.id = inject.enroll.data.injector_id;
+      injector.token = inject.enroll.data.injector_token;
+      injector.needles.push(...encodings(String(injector.token)));
+    }
+    check(
+      "injector: a scripted injector (P-256 key generated here, private key non-extractable) is enrolled over LOCAL STDIO; the token is returned once",
+      inject.enroll.ok && /^inj_[0-9a-f]{16}$/.test(String(injector.id)) && /^ein_[A-Za-z0-9_-]{43}$/.test(String(injector.token)) && injector.keys.privateKey.extractable === false,
+      inject.enroll.ok ? `${injector.id}` : `enroll failed: ${inject.enroll.error}`,
+    );
+    if (!inject.enroll.ok) return;
+  }
+
   let serverLog = "";
   const server = spawn("npm", ["run", "dev", "--", "--host", "127.0.0.1", "--port", String(port)], {
     cwd: ROOT,
@@ -323,6 +438,7 @@ async function main() {
   // -- the owner, through public surfaces only
   const owner = {
     approvals: [], // { ref, action, resource, callbackStatus }
+    ignored: [], // approval prompts the owner deliberately left undecided (--inject)
     strangerTap: null,
     badSecretStatus: null,
     card: null, // { getStatus, postStatus, fingerprintOk, replayStatus, postResponse }
@@ -368,6 +484,11 @@ async function main() {
         await sleep(300);
         const answer = telegram.calls.find((c) => c.method === "answerCallbackQuery" && c.payload.callback_query_id === stranger.callbackId);
         owner.strangerTap = { status: stranger.status, answer: answer?.payload?.text ?? null };
+      }
+      if (action === "vault.entry.inject" && owner.approvals.some((a) => a.action === "vault.entry.inject")) {
+        // --inject: the client's deliberate repeat. The owner leaves it undecided; it must stay pending and mint nothing.
+        owner.ignored.push({ ref, action, resource });
+        return;
       }
       const real = await tap(message, buttons.approve, APPROVER_ID, secrets.webhookSecret);
       owner.approvals.push({ ref, action, resource, callbackStatus: real.status });
@@ -438,6 +559,7 @@ async function main() {
     "--fingerprint", `${credentialFingerprint}:${storedSecret.length}`,
   ];
   if (!control.reachable) clientArgs.push("--expect-use-error", "entry_use_failed");
+  if (INJECT_MODE) clientArgs.push("--inject-origin", INJECT_ORIGIN, "--inject-mode", "cookies");
   let clientOut = "";
   const client = spawn(process.execPath, clientArgs, { cwd: ROOT, env: baseEnv(), detached: true, stdio: ["ignore", "pipe", "pipe"] });
   cleanups.push(() => stopGroup(client, 1000));
@@ -455,6 +577,58 @@ async function main() {
   out("------------------------------------------------------");
   out("");
 
+  // -- --inject: the scripted injector redeems the ticket the client was given, while the server is still up
+  if (INJECT_MODE) {
+    try {
+      const minted = JSON.parse(readFileSync(transcriptPath, "utf8"))?.inject ?? null;
+      inject.minted = minted;
+      const post = async (path, token, body) => {
+        const res = await fetch(`${vault}${path}`, {
+          method: "POST",
+          headers: { "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}) },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(20_000),
+        });
+        const text = await res.text();
+        let json = null;
+        try {
+          json = JSON.parse(text);
+        } catch {
+          json = null;
+        }
+        return { status: res.status, json, text, cacheControl: res.headers.get("cache-control"), cors: [...res.headers.keys()].filter((h) => h.startsWith("access-control-")) };
+      };
+      if (minted?.ticket) {
+        // The injector token is no tool credential.
+        inject.mcpWithToken = (await post("/api/mcp", injector.token, { jsonrpc: "2.0", id: 1, method: "tools/list" })).status;
+        inject.restWithToken = (await post("/api/rest/tool", injector.token, { tool: "vault_status", arguments: {} })).status;
+        inject.noToken = (await post("/api/injector/redeem", null, { ticket: minted.ticket })).status;
+        inject.redeem = await post("/api/injector/redeem", injector.token, { ticket: minted.ticket });
+        inject.redeemBodyText = inject.redeem.text;
+        if (inject.redeem.status === 200 && inject.redeem.json?.sealed) {
+          const want = { ticket: minted.ticket, target_origin: INJECT_ORIGIN, mode: "cookies" };
+          inject.plain = await openSealed(inject.redeem.json.sealed, want);
+          const sealed = inject.redeem.json.sealed;
+          const flipped = Buffer.from(sealed.ct, "base64url");
+          flipped[0] ^= 1;
+          const refused = async (blob, expect = want) => openSealed(blob, expect).then(() => false, () => true);
+          inject.tamper = {
+            ct: await refused({ ...sealed, ct: flipped.toString("base64url") }),
+            aad: await refused({ ...sealed, aad: Buffer.from("eit:x|y|https://evil.example|cookies").toString("base64url") }, { ...want, target_origin: "https://evil.example" }),
+            origin: await refused(sealed, { ...want, target_origin: `https://other.${SITE}` }),
+          };
+        }
+        inject.replay = await post("/api/injector/redeem", injector.token, { ticket: minted.ticket });
+        inject.report = await post("/api/injector/report", injector.token, {
+          ticket_sha256: createHash("sha256").update(minted.ticket, "utf8").digest("hex"),
+          result: "injected",
+        });
+      }
+    } catch (err) {
+      inject.error = err?.name ?? "error";
+    }
+  }
+
   // -- stop the server, then read the database it left behind
   await stopGroup(server);
   await sleep(300);
@@ -468,7 +642,7 @@ async function main() {
     transcript = null;
   }
 
-  check("proof-client exits 0 with verdict PASS (11 of 11 steps)", clientCode === 0 && transcript?.verdict?.passed === true, `exit ${clientCode}, steps ${transcript?.verdict?.steps_passed ?? "?"}/${transcript?.verdict?.steps_total ?? "?"}`);
+  check(`proof-client exits 0 with verdict PASS (${INJECT_MODE ? "12 of 12" : "11 of 11"} steps)`, clientCode === 0 && transcript?.verdict?.passed === true, `exit ${clientCode}, steps ${transcript?.verdict?.steps_passed ?? "?"}/${transcript?.verdict?.steps_total ?? "?"}`);
 
   // -- owner surfaces
   check("Telegram stand-in received the vault's messages (preload active, src/ untouched)", telegram.calls.some((c) => c.method === "sendMessage"), `${telegram.calls.length} Bot API calls, ${telegram.rejected.length} rejected`);
@@ -478,7 +652,17 @@ async function main() {
   const firstUse = owner.approvals.find((a) => a.action === "vault.entry.use.read");
   check("owner approval 1: the connection (vault.client.authorize) via the webhook", connect?.callbackStatus === 200, connect ? `${connect.resource}, ref ${connect.ref}` : "no such approval message");
   check("owner approval 2: first use of the entry (vault.entry.use.read) via the webhook", firstUse?.callbackStatus === 200, firstUse ? `${firstUse.resource}, ref ${firstUse.ref}` : "no such approval message");
-  check("exactly two approvals were requested and nothing else was approved", owner.approvals.length === 2, `${owner.approvals.length} approval message(s)`);
+  if (INJECT_MODE) {
+    const injectApproval = owner.approvals.find((a) => a.action === "vault.entry.inject");
+    check("owner approval 3: this ONE injection (vault.entry.inject) via the webhook", injectApproval?.callbackStatus === 200, injectApproval ? `${injectApproval.resource}, ref ${injectApproval.ref}` : "no such approval message");
+    check(
+      "exactly three approvals were approved; the client's repeated injection request reached the owner as a NEW prompt and was left undecided",
+      owner.approvals.length === 3 && owner.ignored.length === 1 && owner.ignored[0].action === "vault.entry.inject" && owner.ignored[0].ref !== injectApproval?.ref,
+      `${owner.approvals.length} approved, ${owner.ignored.length} left pending`,
+    );
+  } else {
+    check("exactly two approvals were requested and nothing else was approved", owner.approvals.length === 2, `${owner.approvals.length} approval message(s)`);
+  }
   check("card page: form served, script-free CSP, secret field present", owner.card?.getStatus === 200 && owner.card.hasSecretField && /default-src 'none'/.test(owner.card.csp), `GET ${owner.card?.getStatus ?? "-"}`);
   check("card page: owner's POST stored the credential (fingerprint and length match)", owner.card?.postStatus === 200 && owner.card.stored && owner.card.fingerprintOk, `POST ${owner.card?.postStatus ?? "-"}`);
   check("card link is dead after one use", owner.card?.replayStatus === 410, `GET again → ${owner.card?.replayStatus ?? "-"}`);
@@ -502,6 +686,36 @@ async function main() {
     check("!!! entry_use FAILED CLOSED (entry_use_failed) — NO successful injected request was proven", use?.expected_failure === true && use.error === "entry_use_failed", `error ${use?.error ?? "-"}`);
   }
 
+  // -- --inject: what the scripted injector got, and what nobody else did
+  if (INJECT_MODE) {
+    const minted = inject.minted ?? null;
+    check("injector pass ran without a script error", inject.error === null, inject.error ?? "");
+    check(
+      "entry_inject gave the client a ticket and metadata only (ticket, expiry, injector, entry label/kind, origin, mode)",
+      minted && /^eit_[A-Za-z0-9_-]{32}$/.test(minted.ticket) && minted.injector_id === injector.id && minted.target_origin === INJECT_ORIGIN && minted.mode === "cookies" && minted.entry?.kind === "cookie",
+      minted ? `injector ${minted.injector_id}, ${minted.mode} → ${minted.target_origin}` : "no inject result in the transcript",
+    );
+    check(
+      "the injector token is not a tool credential (401 on /api/mcp and /api/rest/tool); redeem without a token is 401",
+      inject.mcpWithToken === 401 && inject.restWithToken === 401 && inject.noToken === 401,
+      `mcp ${inject.mcpWithToken}, rest ${inject.restWithToken}, redeem without token ${inject.noToken}`,
+    );
+    check(
+      "redeem over HTTP as the injector: 200, Cache-Control: no-store, no CORS header, ciphertext only",
+      inject.redeem?.status === 200 && inject.redeem.cacheControl === "no-store" && inject.redeem.cors.length === 0 && inject.redeem.json?.sealed?.alg === "ECDH-ES+HKDF-SHA256+A256GCM" && !holdsAny(inject.redeemBodyText, credentialNeedles),
+      `status ${inject.redeem?.status ?? "-"}${inject.redeem?.json?.error ? ` (${inject.redeem.json.error})` : ""}`,
+    );
+    const cookies = Array.isArray(inject.plain?.cookies) ? inject.plain.cookies : [];
+    check(
+      "the scripted injector decrypted the blob with its private key: the cookie equals what the owner typed on the card",
+      inject.plain?.v === 1 && cookies.length === 1 && cookies[0].name === COOKIE_NAME && cookies[0].value === secrets.credential && cookies[0].domain === SITE && cookies[0].hostOnly === true,
+      cookies.length ? `${cookies.length} cookie, name "${cookies[0].name}", domain ${cookies[0].domain}, value matches: ${cookies[0].value === secrets.credential}` : "nothing decrypted",
+    );
+    check("a tampered ciphertext, a forged AAD and another origin are all refused by the injector's decryption", inject.tamper?.ct === true && inject.tamper?.aad === true && inject.tamper?.origin === true);
+    check("the ticket is single use: a second redeem is 409 ticket_used", inject.replay?.status === 409 && inject.replay.json?.error === "ticket_used", `status ${inject.replay?.status ?? "-"}`);
+    check("the injector reported the outcome (POST /api/injector/report → 200)", inject.report?.status === 200 && inject.report.json?.ok === true, `status ${inject.report?.status ?? "-"}`);
+  }
+
   // -- what the server itself logged about the outbound request and about failures
   const logEvents = serverLog
     .split("\n")
@@ -520,7 +734,10 @@ async function main() {
   const errorEvents = logEvents.filter((e) => e.level === "error").map((e) => e.event);
   check("server log: no error-level event during the run", errorEvents.length === 0, [...new Set(errorEvents)].join(", "));
   const warnEvents = [...new Set(logEvents.filter((e) => e.level === "warn").map((e) => `${e.event}${e.reason ? `(${e.reason})` : ""}`))];
-  check("server log: the only warnings are the two refused taps this script provoked", warnEvents.every((w) => ["telegram_webhook_rejected(bad_secret)", "vault_approval_decision_rejected(unauthorized_user)"].includes(w)), warnEvents.join(", ") || "none");
+  const expectedWarnings = ["telegram_webhook_rejected(bad_secret)", "vault_approval_decision_rejected(unauthorized_user)"];
+  // --inject: the replayed ticket this script sent on purpose.
+  if (INJECT_MODE) expectedWarnings.push("vault_inject_redeem_refused");
+  check(INJECT_MODE ? "server log: the only warnings are the two refused taps and the refused ticket replay this script provoked" : "server log: the only warnings are the two refused taps this script provoked", warnEvents.every((w) => expectedWarnings.includes(w)), warnEvents.join(", ") || "none");
 
   // -- where the credential is, and is not
   check("credential IS in the owner's card form POST (the one place it is typed)", holdsAny(owner.cardPostBody ?? "", credentialNeedles));
@@ -574,6 +791,18 @@ async function main() {
   }
   check("credential is NOT in any file on disk (temp dir: database files, transcript)", !fileHit, `${filesScanned} files`);
 
+  if (INJECT_MODE) {
+    // The injector token, the derived AES key and the ECDH shared secret: nowhere but in this script's memory.
+    const corpus = { "client transcript": transcriptText, "client output": clientOut, "server log": serverLog, "Telegram payloads": JSON.stringify(telegram.calls), "database rows": dbDump ?? "", "fake gate traffic": JSON.stringify(gate.traffic), "stdio enrollment stderr": inject.enroll?.stderr ?? "" };
+    const hits = Object.entries(corpus).filter(([, text]) => holdsAny(text, injector.needles)).map(([name]) => name);
+    check(
+      "injector token, derived key and shared secret are NOT in the client transcript, client output, server log, Telegram payloads, database or gate traffic",
+      injector.needles.length >= 9 && dbDump !== null && hits.length === 0,
+      hits.length ? `found in: ${hits.join(", ")}` : `${injector.needles.length} encodings searched`,
+    );
+    check("the raw ticket is NOT in the server log, any Telegram payload or the database (stored as sha256)", Boolean(inject.minted?.ticket) && dbDump !== null && !holdsAny(`${serverLog}\n${JSON.stringify(telegram.calls)}\n${dbDump}`, [inject.minted?.ticket ?? "\u0000"]));
+  }
+
   const leakedKeys = [...new Set([...keysFoundIn(serverLog), ...keysFoundIn(transcriptText), ...keysFoundIn(clientOut), ...keysFoundIn(JSON.stringify(telegram.calls)), ...keysFoundIn(dbDump ?? ""), ...keysFoundIn(JSON.stringify(gate.traffic))])];
   check("no server key (bot token, HMAC keys, webhook secret, gate API key) in log, transcript, Telegram payloads or database", leakedKeys.length === 0, leakedKeys.join(", "));
 
@@ -586,8 +815,8 @@ async function main() {
   check("the vault's own audit_verify reported the chain intact", transcript?.chain?.ok === true, `count ${transcript?.chain?.count ?? "-"}`);
   const taps = ledger.filter((r) => r.capability === "vault.approval.decide" && r.client_id === "owner:telegram");
   check(
-    "ledger: both owner decisions are on the chain (vault.approval.decide: the connection, then the first use)",
-    taps.length === 2 && taps.every((r) => r.decision === "allow" && r.result === "ok" && r.approval_id) && /^vault\.client\.authorize /.test(taps[0]?.resource ?? "") && /^vault\.entry\.use\.read /.test(taps[1]?.resource ?? ""),
+    INJECT_MODE ? "ledger: the owner's three decisions are on the chain (vault.approval.decide: the connection, the first use, the injection)" : "ledger: both owner decisions are on the chain (vault.approval.decide: the connection, then the first use)",
+    taps.length === (INJECT_MODE ? 3 : 2) && (!INJECT_MODE || /^vault\.entry\.inject /.test(taps[2]?.resource ?? "")) && taps.every((r) => r.decision === "allow" && r.result === "ok" && r.approval_id) && /^vault\.client\.authorize /.test(taps[0]?.resource ?? "") && /^vault\.entry\.use\.read /.test(taps[1]?.resource ?? ""),
     taps.map((r) => `seq ${r.seq}`).join(", ") || "missing",
   );
   const cardRow = mine.find((r) => r.capability === "vault.card.request");
@@ -601,11 +830,56 @@ async function main() {
     check("ledger: the approved use is recorded as an error (entry_use_failed), same approval id", doneUse?.result === "error" && doneUse.approval_id === pendingUse?.approval_id, doneUse ? `seq ${doneUse.seq}, error ${doneUse.error}` : "missing");
   }
 
+  if (INJECT_MODE) {
+    const injectRows = ledger.filter((r) => String(r.capability).startsWith("vault.entry.inject"));
+    const shape = injectRows.map((r) => `${r.capability.replace("vault.entry.", "")}:${r.result}`).join(" ");
+    const approved = injectRows.find((r) => r.capability === "vault.entry.inject" && r.result === "ok");
+    const bound = injectRows.filter((r) => r.approval_id === approved?.approval_id);
+    check(
+      "ledger: inject pending → committing → ok (ticket minted), the consumed approval refused, a new pending request, then redeem ok, a refused replay, and the result — bound to the one approval, entry ref and injector id",
+      shape === "inject:pending_approval inject:committing inject:ok inject:denied inject:pending_approval inject.redeem:ok inject.redeem:error inject.result:ok" &&
+        bound.length === 7 &&
+        bound.every((r) => String(r.resource).endsWith(`#${injector.id}`)) &&
+        bound.filter((r) => r.result === "ok").every((r) => /^vault:\/\/entry\/ve_[0-9a-f]{32}$/.test(r.credential_ref ?? "")) &&
+        bound.filter((r) => String(r.capability).includes("redeem") || String(r.capability).includes("result")).every((r) => r.client_id === `injector:${injector.id}`),
+      shape,
+    );
+    const ticketRows = (() => {
+      try {
+        return JSON.parse(dbDump ?? "{}").vault_inject_tickets ?? [];
+      } catch {
+        return [];
+      }
+    })();
+    const injectorRows = (() => {
+      try {
+        return JSON.parse(dbDump ?? "{}").vault_injectors ?? [];
+      } catch {
+        return [];
+      }
+    })();
+    const ticketHash = inject.minted?.ticket ? createHash("sha256").update(inject.minted.ticket, "utf8").digest("hex") : null;
+    check(
+      "database: exactly one ticket row (sha256 only, redeemed, result injected) and one injector row (token sha256 only)",
+      ticketRows.length === 1 && ticketRows[0].sha256 === ticketHash && ticketRows[0].redeemed_at !== null && ticketRows[0].result === "injected" && ticketRows[0].injector_id === injector.id &&
+        injectorRows.length === 1 && injectorRows[0].token_sha256 === createHash("sha256").update(String(injector.token), "utf8").digest("hex"),
+      `${ticketRows.length} ticket row(s), ${injectorRows.length} injector row(s)`,
+    );
+  }
+
   // The connection approval is not a ledger row (see docs/ops/e2e-proof.md); its record is the approvals table.
   const decided = approvalRows.filter((r) => String(r.decided_by ?? "") === String(APPROVER_ID) && ["approved", "consumed"].includes(r.status));
+  if (INJECT_MODE) {
+    const injectApprovals = approvalRows.filter((r) => r.capability === "vault.entry.inject");
+    check(
+      "approvals table: the injection approval is consumed (single use); the repeated request is a second, still-pending approval that minted nothing",
+      approvalRows.length === 4 && decided.length === 3 && injectApprovals.length === 2 && injectApprovals.filter((r) => r.status === "consumed").length === 1 && injectApprovals.filter((r) => r.status === "pending").length === 1,
+      approvalRows.map((r) => `${r.capability}:${r.status}`).join(", "),
+    );
+  }
   check(
     "approvals table: both approvals decided by the approver id, bound to their request digest",
-    approvalRows.length === 2 && decided.length === 2 && decided.some((r) => r.capability === "vault.client.authorize") && decided.some((r) => r.capability === "vault.entry.use.read" && r.status === "consumed") && decided.every((r) => /^[0-9a-f]{64}$/.test(r.request_digest ?? "")),
+    (INJECT_MODE || (approvalRows.length === 2 && decided.length === 2)) && decided.some((r) => r.capability === "vault.client.authorize") && decided.some((r) => r.capability === "vault.entry.use.read" && r.status === "consumed") && decided.every((r) => /^[0-9a-f]{64}$/.test(r.request_digest ?? "")),
     approvalRows.map((r) => `${r.capability}:${r.status}`).join(", "),
   );
 
@@ -642,6 +916,6 @@ for (const r of rows) out(`${r.ok ? "PASS" : "FAIL"}  ${r.name.padEnd(width)}${r
 const failed = rows.filter((r) => !r.ok).length;
 out("-------------------------------------------------------------------");
 const pass = failed === 0 && rows.length > 0;
-out(`${rows.length - failed} of ${rows.length} checks passed${COOKIE_MODE ? " (cookie entry)" : ""} — ${pass ? (failClosedOnly ? "REHEARSAL PASS, FAIL-CLOSED PATH ONLY (the site was unreachable: no successful injected request was proven)" : "REHEARSAL PASS") : "REHEARSAL FAIL"}`);
-out("Not proven by a rehearsal: real Telegram delivery, the real canonical vault, a human owner. See docs/ops/e2e-proof.md.");
+out(`${rows.length - failed} of ${rows.length} checks passed${INJECT_MODE ? " (cookie entry + injector channel, scripted injector)" : COOKIE_MODE ? " (cookie entry)" : ""} — ${pass ? (failClosedOnly ? "REHEARSAL PASS, FAIL-CLOSED PATH ONLY (the site was unreachable: no successful injected request was proven)" : "REHEARSAL PASS") : "REHEARSAL FAIL"}`);
+out(`Not proven by a rehearsal: real Telegram delivery, the real canonical vault, a human owner${INJECT_MODE ? ", the real browser extension or any browser" : ""}. See docs/ops/e2e-proof.md.`);
 process.exit(failed === 0 && rows.length > 0 ? 0 : 1);

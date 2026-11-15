@@ -17,6 +17,8 @@ import { Route as CardTokenRouteImport } from './routes/card/$token'
 import { Route as ConsoleIndexRouteImport } from './routes/console/index'
 import { Route as ConsoleSplatRouteImport } from './routes/console/$'
 import { Route as DotwellKnownOauthProtectedResourceSplatRouteImport } from './routes/[.]well-known/oauth-protected-resource/$'
+import { Route as ApiInjectorRedeemRouteImport } from './routes/api/injector/redeem'
+import { Route as ApiInjectorReportRouteImport } from './routes/api/injector/report'
 import { Route as ApiOauthAuthorizeRouteImport } from './routes/api/oauth/authorize'
 import { Route as ApiOauthRegisterRouteImport } from './routes/api/oauth/register'
 import { Route as ApiOauthRevokeRouteImport } from './routes/api/oauth/revoke'
@@ -67,6 +69,16 @@ const DotwellKnownOauthProtectedResourceSplatRoute =
     path: '/$',
     getParentRoute: () => DotwellKnownOauthProtectedResourceRoute,
   } as any)
+const ApiInjectorRedeemRoute = ApiInjectorRedeemRouteImport.update({
+  id: '/api/injector/redeem',
+  path: '/api/injector/redeem',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ApiInjectorReportRoute = ApiInjectorReportRouteImport.update({
+  id: '/api/injector/report',
+  path: '/api/injector/report',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const ApiOauthAuthorizeRoute = ApiOauthAuthorizeRouteImport.update({
   id: '/api/oauth/authorize',
   path: '/api/oauth/authorize',
@@ -107,6 +119,8 @@ export interface FileRoutesByFullPath {
   '/console/$': typeof ConsoleSplatRoute
   '/console/': typeof ConsoleIndexRoute
   '/.well-known/oauth-protected-resource/$': typeof DotwellKnownOauthProtectedResourceSplatRoute
+  '/api/injector/redeem': typeof ApiInjectorRedeemRoute
+  '/api/injector/report': typeof ApiInjectorReportRoute
   '/api/oauth/authorize': typeof ApiOauthAuthorizeRoute
   '/api/oauth/register': typeof ApiOauthRegisterRoute
   '/api/oauth/revoke': typeof ApiOauthRevokeRoute
@@ -123,6 +137,8 @@ export interface FileRoutesByTo {
   '/console/$': typeof ConsoleSplatRoute
   '/console': typeof ConsoleIndexRoute
   '/.well-known/oauth-protected-resource/$': typeof DotwellKnownOauthProtectedResourceSplatRoute
+  '/api/injector/redeem': typeof ApiInjectorRedeemRoute
+  '/api/injector/report': typeof ApiInjectorReportRoute
   '/api/oauth/authorize': typeof ApiOauthAuthorizeRoute
   '/api/oauth/register': typeof ApiOauthRegisterRoute
   '/api/oauth/revoke': typeof ApiOauthRevokeRoute
@@ -140,6 +156,8 @@ export interface FileRoutesById {
   '/console/$': typeof ConsoleSplatRoute
   '/console/': typeof ConsoleIndexRoute
   '/.well-known/oauth-protected-resource/$': typeof DotwellKnownOauthProtectedResourceSplatRoute
+  '/api/injector/redeem': typeof ApiInjectorRedeemRoute
+  '/api/injector/report': typeof ApiInjectorReportRoute
   '/api/oauth/authorize': typeof ApiOauthAuthorizeRoute
   '/api/oauth/register': typeof ApiOauthRegisterRoute
   '/api/oauth/revoke': typeof ApiOauthRevokeRoute
@@ -158,6 +176,8 @@ export interface FileRouteTypes {
     | '/console/$'
     | '/console/'
     | '/.well-known/oauth-protected-resource/$'
+    | '/api/injector/redeem'
+    | '/api/injector/report'
     | '/api/oauth/authorize'
     | '/api/oauth/register'
     | '/api/oauth/revoke'
@@ -174,6 +194,8 @@ export interface FileRouteTypes {
     | '/console/$'
     | '/console'
     | '/.well-known/oauth-protected-resource/$'
+    | '/api/injector/redeem'
+    | '/api/injector/report'
     | '/api/oauth/authorize'
     | '/api/oauth/register'
     | '/api/oauth/revoke'
@@ -190,6 +212,8 @@ export interface FileRouteTypes {
     | '/console/$'
     | '/console/'
     | '/.well-known/oauth-protected-resource/$'
+    | '/api/injector/redeem'
+    | '/api/injector/report'
     | '/api/oauth/authorize'
     | '/api/oauth/register'
     | '/api/oauth/revoke'
@@ -206,6 +230,8 @@ export interface RootRouteChildren {
   CardTokenRoute: typeof CardTokenRoute
   ConsoleSplatRoute: typeof ConsoleSplatRoute
   ConsoleIndexRoute: typeof ConsoleIndexRoute
+  ApiInjectorRedeemRoute: typeof ApiInjectorRedeemRoute
+  ApiInjectorReportRoute: typeof ApiInjectorReportRoute
   ApiOauthAuthorizeRoute: typeof ApiOauthAuthorizeRoute
   ApiOauthRegisterRoute: typeof ApiOauthRegisterRoute
   ApiOauthRevokeRoute: typeof ApiOauthRevokeRoute
@@ -271,6 +297,20 @@ declare module '@tanstack/react-router' {
       fullPath: '/.well-known/oauth-protected-resource/$'
       preLoaderRoute: typeof DotwellKnownOauthProtectedResourceSplatRouteImport
       parentRoute: typeof DotwellKnownOauthProtectedResourceRoute
+    }
+    '/api/injector/redeem': {
+      id: '/api/injector/redeem'
+      path: '/api/injector/redeem'
+      fullPath: '/api/injector/redeem'
+      preLoaderRoute: typeof ApiInjectorRedeemRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/injector/report': {
+      id: '/api/injector/report'
+      path: '/api/injector/report'
+      fullPath: '/api/injector/report'
+      preLoaderRoute: typeof ApiInjectorReportRouteImport
+      parentRoute: typeof rootRouteImport
     }
     '/api/oauth/authorize': {
       id: '/api/oauth/authorize'
@@ -342,6 +382,8 @@ const rootRouteChildren: RootRouteChildren = {
   CardTokenRoute: CardTokenRoute,
   ConsoleSplatRoute: ConsoleSplatRoute,
   ConsoleIndexRoute: ConsoleIndexRoute,
+  ApiInjectorRedeemRoute: ApiInjectorRedeemRoute,
+  ApiInjectorReportRoute: ApiInjectorReportRoute,
   ApiOauthAuthorizeRoute: ApiOauthAuthorizeRoute,
   ApiOauthRegisterRoute: ApiOauthRegisterRoute,
   ApiOauthRevokeRoute: ApiOauthRevokeRoute,

@@ -4,7 +4,7 @@
  * Telegram, GitHub and the credential's own site. No network, no real vault.
  */
 import assert from "node:assert/strict";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, generateKeyPairSync, randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,6 +23,8 @@ import { MemoryDigestStateStore, type Digest } from "./digest.ts";
 import { MemoryEntryGrantStore, revokeEntryGrant } from "./entry-grants.ts";
 import { MemoryAnchorStore } from "./ledger-anchor.ts";
 import { dispatchTool, isForbiddenToolName, listTools, TOOL_DEFINITIONS, type GatewayDeps, type GatewayResult } from "./gateway.ts";
+import { handleInjectorRedeem, handleInjectorReport } from "./injector-http.ts";
+import { enrollInjector, MemoryInjectorStore, MemoryInjectTicketStore, type InjectorDeps } from "./injector.ts";
 import { InstallationTokenCache } from "./github-app.ts";
 import { handleMcpGet, handleMcpPost, handleRestTool } from "./http-transport.ts";
 import { Ledger, MemoryLedgerStore } from "./ledger.ts";
@@ -469,6 +471,51 @@ describe("HTTP transports authenticate before anything else", () => {
     assert.equal(row.client_id, "workload:sdk-gate");
     const bad = await handleRestTool(rpc({ authorization: `Bearer ${workloadToken}` }, { tool: "audit_list", arguments: {} }), w.deps);
     assert.equal(((await bad.json()) as { result: { error: string } }).result.error, "missing_scope");
+  });
+
+  it("token types do not cross: an injector token (ein_) calls no tool, and OAuth / workload tokens cannot redeem or report", async () => {
+    const w = makeWorld();
+    const injectors = new MemoryInjectorStore();
+    const injector: InjectorDeps = { injectors, tickets: new MemoryInjectTicketStore(), rateLimit: new MemoryRateLimitStore(), ledger: w.deps.ledger };
+    const { x, y } = generateKeyPairSync("ec", { namedCurve: "P-256" }).publicKey.export({ format: "jwk" });
+    const enrolled = await enrollInjector({ name: "browser", public_key_jwk: { kty: "EC", crv: "P-256", x, y } }, injector);
+    secretsToScan.add(enrolled.token);
+    const ein = `Bearer ${enrolled.token}`;
+    const injectorPost = (handler: typeof handleInjectorRedeem, path: string, authorization: string, body: unknown) =>
+      handler(new Request(`${BASE}${path}`, { method: "POST", headers: { "content-type": "application/json", authorization }, body: JSON.stringify(body) }), injector);
+    const bogusTicket = { ticket: `eit_${randomBytes(24).toString("base64url")}` };
+
+    // The injector token is a real, active credential on its own endpoint (404: it authenticated, the ticket is unknown) …
+    const own = await injectorPost(handleInjectorRedeem, "/api/injector/redeem", ein, bogusTicket);
+    assert.deepEqual([own.status, await own.json()], [404, { ok: false, error: "ticket_not_found" }]);
+    // … and nothing at all on the tool transports.
+    const before = (await w.rows()).length;
+    const mcpList = await handleMcpPost(rpc({ authorization: ein }), { ...w.deps, injector });
+    assert.equal(mcpList.status, 401);
+    assert.match(mcpList.headers.get("www-authenticate") ?? "", /error="invalid_token"/);
+    const mcpCall = await handleMcpPost(rpc({ authorization: ein }, { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "vault_status", arguments: {} } }), { ...w.deps, injector });
+    assert.equal(mcpCall.status, 401);
+    for (const tool of ["vault_status", "entry_inject", "admin_list_injectors", "entry_use"]) {
+      const rest = await handleRestTool(rpc({ authorization: ein }, { tool, arguments: {} }), { ...w.deps, injector });
+      assert.equal(rest.status, 401, tool);
+      assert.equal(((await rest.json()) as { error: string }).error, "invalid_token");
+    }
+    const get = (await (await handleMcpGet(new Request(`${BASE}/api/mcp`, { headers: { authorization: ein } }))).json()) as { tools?: unknown; client_id?: unknown };
+    assert.deepEqual([get.tools, get.client_id], [undefined, undefined], "not even the tool list");
+    assert.equal((await w.rows()).length, before, "no tool ran for the injector token");
+
+    // An OAuth access token and a workload token are valid tool credentials …
+    const eva = await connect("vault.read vault.write");
+    assert.match(eva, /^eva_/);
+    assert.equal((await handleRestTool(rpc({ authorization: `Bearer ${eva}` }, { tool: "vault_status", arguments: {} }), w.deps)).status, 200);
+    assert.equal((await handleRestTool(rpc({ authorization: `Bearer ${workloadToken}` }, { tool: "vault_status", arguments: {} }), w.deps)).status, 200);
+    // … and are refused on both injector endpoints.
+    for (const token of [eva, workloadToken]) {
+      const redeem = await injectorPost(handleInjectorRedeem, "/api/injector/redeem", `Bearer ${token}`, bogusTicket);
+      assert.deepEqual([redeem.status, await redeem.json()], [401, { ok: false, error: "invalid_injector" }], token.slice(0, 4));
+      const report = await injectorPost(handleInjectorReport, "/api/injector/report", `Bearer ${token}`, { ticket_sha256: "0".repeat(64), result: "injected" });
+      assert.deepEqual([report.status, await report.json()], [401, { ok: false, error: "invalid_injector" }], token.slice(0, 4));
+    }
   });
 });
 

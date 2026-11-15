@@ -65,6 +65,10 @@ Options
                          3fa9c1d2:44). Everything the client received is searched for a substring
                          with that SHA-256 prefix. Implies --fingerprint-check.
   --expect-use-error <c> Rehearsal only: pass the entry_use step when it fails with exactly this error.
+  --inject-origin <o>    Also ask for a browser injection (entry_inject, docs/ops/injector-contract.md) into
+                         https://<host> after the use: one more owner approval, and the transcript records the
+                         single-use ticket (metadata only — this client can never open what the ticket releases).
+  --inject-mode <m>      cookies | field (default: cookies for a cookie entry, field otherwise).
   --help
 
 Exit code 0 only when every step passed and no secret was observed.
@@ -303,6 +307,8 @@ export function parseCli(argv) {
       "fingerprint-check": { type: "boolean", default: false },
       fingerprint: { type: "string" },
       "expect-use-error": { type: "string" },
+      "inject-origin": { type: "string" },
+      "inject-mode": { type: "string" },
       "poll-ms": { type: "string", default: "3000" },
       help: { type: "boolean", default: false },
     },
@@ -325,6 +331,10 @@ export function parseCli(argv) {
     fingerprint = parseFingerprint(values.fingerprint);
     if (!fingerprint) problems.push("--fingerprint must look like 3fa9c1d2:44 (8 hex characters, a colon, the length)");
   }
+  if (values["inject-origin"] !== undefined && !/^https:\/\/[a-z0-9.-]+$/.test(values["inject-origin"])) {
+    problems.push("--inject-origin must look like https://host (lower case, no path)");
+  }
+  if (values["inject-mode"] !== undefined && !["cookies", "field"].includes(values["inject-mode"])) problems.push("--inject-mode must be cookies or field");
   if (problems.length) return { problems };
   return {
     vault: new URL(values.vault).origin,
@@ -342,6 +352,8 @@ export function parseCli(argv) {
     fingerprintCheck: values["fingerprint-check"] || fingerprint !== null,
     fingerprint,
     expectUseError: values["expect-use-error"] ?? null,
+    injectOrigin: values["inject-origin"] ?? null,
+    injectMode: values["inject-mode"] ?? (values.kind === "cookie" ? "cookies" : "field"),
   };
 }
 
@@ -365,6 +377,7 @@ class ProofRun {
     this.clientId = null;
     this.endpoints = null;
     this.useResult = null;
+    this.injectResult = null;
     this.ledgerRows = [];
     this.chain = null;
     this.metadataLeaks = [];
@@ -769,6 +782,66 @@ class ProofRun {
     return `GET https://${this.o.site}${this.o.path} → ${d.status}, secret injected server-side${approvalId ? `, approval ${approvalId.slice(0, 8)}…` : " (covered by an existing grant)"}`;
   }
 
+  // ---- 8b. entry_inject (only with --inject-origin)
+  async inject() {
+    const args = {
+      site: this.o.site,
+      account: this.o.account,
+      target_origin: this.o.injectOrigin,
+      mode: this.o.injectMode,
+      task: "End-to-end proof: place this credential into the owner's own browser.",
+    };
+    const first = await this.tool("entry_inject", "entry_inject", args);
+    if (first.ok) throw new ProofError("entry_inject", "entry_inject issued a ticket WITHOUT an owner approval");
+    if (first.error !== "approval_required") throw this.toolFailure("entry_inject", "entry_inject", first);
+    const approvalId = first.approval_id;
+    if (typeof approvalId !== "string") throw new ProofError("entry_inject", "approval_required came without an approval_id");
+    this.print("");
+    this.print("       OWNER ACTION: approve this one injection on Telegram (asked again for every injection).");
+    this.print(`       approval ${approvalId.slice(0, 8)}…, expires ${first.expires_at}`);
+    this.print("");
+    const deadline = Date.now() + this.o.timeoutMs;
+    for (;;) {
+      await sleep(this.o.pollMs);
+      const s = await this.tool("approval_status", "approval_status", { approval_id: approvalId });
+      if (!s.ok) throw this.toolFailure("approval_status", "approval_status", s);
+      const status = s.data?.status;
+      if (status === "approved") break;
+      if (status === "denied") throw new ProofError("entry_inject", "the owner DENIED the injection on Telegram");
+      if (status === "expired") throw new ProofError("entry_inject", "the approval expired before the owner decided");
+      if (status !== "pending") throw new ProofError("entry_inject", `unexpected approval status: ${String(status).slice(0, 40)}`);
+      if (Date.now() > deadline) throw new ProofError("entry_inject", `no owner decision within ${this.o.timeoutMs / 1000}s (--timeout-s)`);
+    }
+    const p = await this.tool("entry_inject", "entry_inject", { ...args, approval_id: approvalId });
+    if (!p.ok) throw this.toolFailure("entry_inject", "entry_inject", p);
+    const d = p.data ?? {};
+    const keys = Object.keys(d).sort().join(",");
+    if (keys !== "entry,expires_at,injector_id,mode,target_origin,ticket" || !/^eit_[A-Za-z0-9_-]{32}$/.test(String(d.ticket))) {
+      throw new ProofError("entry_inject", `unexpected entry_inject result shape (${keys.slice(0, 120)})`);
+    }
+    // The approval was single use: the same call again must not mint a second ticket.
+    const again = await this.tool("entry_inject", "entry_inject", { ...args, approval_id: approvalId });
+    if (again.ok || again.error !== "approval_already_consumed") {
+      throw new ProofError("entry_inject", `a consumed approval was accepted again (${again.ok ? "ok" : String(again.error).slice(0, 60)})`);
+    }
+    // And without an approval the owner is asked again: there is no standing grant.
+    const fresh = await this.tool("entry_inject", "entry_inject", args);
+    if (fresh.ok || fresh.error !== "approval_required" || fresh.approval_id === approvalId) {
+      throw new ProofError("entry_inject", "a repeated injection request was not sent back to the owner for a new approval");
+    }
+    this.injectResult = {
+      approval_id_prefix: approvalId.slice(0, 8),
+      unapproved_followup_prefix: String(fresh.approval_id).slice(0, 8),
+      ticket: d.ticket,
+      expires_at: d.expires_at,
+      injector_id: d.injector_id,
+      entry: d.entry,
+      target_origin: d.target_origin,
+      mode: d.mode,
+    };
+    return `ticket for injector ${d.injector_id} (${d.mode} → ${d.target_origin}), expires ${d.expires_at}; a second use of the approval was refused; a repeat asks the owner again`;
+  }
+
   // ---- 9. evidence
   async evidence() {
     const entry = await this.findEntry();
@@ -872,6 +945,7 @@ class ProofRun {
       note: "The client's own access/refresh tokens, authorization code, pending handle and PKCE verifier are masked. Response bodies are otherwise exactly what the client received.",
       steps: this.steps,
       use: this.useResult,
+      ...(this.o.injectOrigin ? { inject: this.injectResult } : {}),
       ledger_rows: this.ledgerRows,
       chain: this.chain,
       secret_scan: scan,
@@ -899,6 +973,7 @@ class ProofRun {
         return detail;
       });
       await this.step("08", "entry_use (GET, secret injected server-side) + owner approval", () => this.use());
+      if (o.injectOrigin) await this.step("08b", "entry_inject (ticket for the owner's browser injector) + owner approval", () => this.inject());
       await this.step("09", "entry_list + audit_list", () => this.evidence());
       await this.step("10", "audit_verify", () => this.verifyChain());
     } catch (err) {
@@ -917,7 +992,7 @@ class ProofRun {
     const verdict = {
       passed: allPassed,
       steps_passed: this.steps.filter((s) => s.ok).length,
-      steps_total: 11,
+      steps_total: o.injectOrigin ? 12 : 11,
       steps_run: this.steps.length,
       chain: this.chain ? (this.chain.ok ? "intact" : "BROKEN") : "not checked",
       secret_observed_by_client: scan.observed ? "POSSIBLY — see secret_scan" : "NO",

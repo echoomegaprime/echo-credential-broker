@@ -162,6 +162,8 @@ interface Notice {
   text: string;
   /** The refusal's error code, when there is one. */
   code?: string;
+  /** Trusted HTML (every dynamic value escaped) rendered once, on this response only: the new injector's token. */
+  once?: string;
 }
 
 interface PageOpts {
@@ -611,8 +613,31 @@ async function securityPage(v: View): Promise<Response> {
     txt(x.user_agent),
     postForm(v.s, "/security/sessions/revoke", hidden("session_id", x.id), x.current ? "Sign out" : "Revoke"),
   ]);
+  const injectors = await call(v, "admin_list_injectors");
+  const injectorRows = listOf(injectors, "injectors").map((i) => [
+    `${txt(i.name)}<br><span class="muted">${txt(i.injector_id)}</span>`,
+    txt(i.key_thumbprint),
+    txt(i.created_at),
+    txt(i.last_used_at),
+    i.status === "active" ? "active" : `<span class="bad">revoked ${txt(i.revoked_at)}</span>`,
+    i.status === "active" ? postForm(v.s, "/security/injectors/revoke", hidden("injector_id", i.injector_id), "Revoke", "danger") : "—",
+  ]);
   const body =
     stepUpPanel(v.s, `${CONSOLE_BASE}/security`) +
+    (v.notice?.once ?? "") +
+    `<h2>Injectors</h2>` +
+    `<p class="muted">A browser injector is your own browser extension. After you approve one request on Telegram it receives that credential encrypted to its key and places it in your browser. See docs/ops/injector-channel.md.</p>` +
+    unavailable(injectors) +
+    table("Injectors", ["Injector", "Public key thumbprint", "Enrolled", "Last used", "Status", "Action"], injectorRows) +
+    `<fieldset><legend>Enroll an injector</legend>` +
+    postForm(
+      v.s,
+      "/security/injectors/enroll",
+      input("name", "Name for this browser", { required: true, max: 64 }) +
+        input("public_key_jwk", "Public key (JWK) shown by the extension", { required: true, max: 600 }),
+      "Enroll (needs passkey confirmation)",
+    ) +
+    `</fieldset>` +
     `<h2>Passkeys</h2>` +
     table("Passkeys", ["Passkey", "Transports", "Added", "Last used", "Flag", "Action"], passkeyRows) +
     `<fieldset><legend>Add a passkey</legend>` +
@@ -751,6 +776,25 @@ const FORM_ACTIONS: Readonly<Record<string, Action>> = {
       };
     },
     render: (v) => auditPage(v),
+  },
+  "/security/injectors/enroll": {
+    run: async (v, f) => {
+      const result = await call(v, "admin_enroll_injector", { name: f("name"), public_key_jwk: f("public_key_jwk") });
+      const d = dataOf(result);
+      if (!d) return noticeOf(result, "");
+      // Shown on this one response (Cache-Control: no-store, like every console page) and never again.
+      const once =
+        `<fieldset><legend>New injector — copy these now</legend><dl>` +
+        `<dt>Injector id</dt><dd><code>${e(d.injector_id)}</code></dd>` +
+        `<dt>Injector token</dt><dd><code>${e(d.injector_token)}</code></dd></dl>` +
+        `<p class="bad">The token is shown only this once and is stored as a hash. Paste it into the extension, then leave this page.</p></fieldset>`;
+      return { ok: true, text: "Injector enrolled.", once };
+    },
+    render: securityPage,
+  },
+  "/security/injectors/revoke": {
+    run: async (v, f) => noticeOf(await call(v, "admin_revoke_injector", { injector_id: f("injector_id") }), "Injector revoked."),
+    render: securityPage,
   },
   "/security/passkeys/remove": {
     run: async (v, f) => noticeOf(await removePasskey(v.s, f("credential_id"), v.deps), "Passkey removed."),
