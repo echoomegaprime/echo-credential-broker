@@ -193,3 +193,13 @@ bearer API token), OpenAI and xAI (`GET /v1/models`, bearer), Stripe
 - **Write tools have no live test**, by design.
 - `credential_health` has no offline success-path test through `dispatchTool`
   (its live test covers it).
+
+## Addendum: owner console (2026-11-14)
+
+The owner console added three tools after this audit: `admin_delete_entry`,
+`admin_request_reentry` and `admin_console_bootstrap` (local stdio only).
+All three are dispatched offline in `src/lib/vault/v2/owner-console.test.ts`,
+on success and refusal paths, together with every other `admin_*` tool run as
+the `owner` identity. None has a live test; none calls a provider. Console
+coverage and its limits (software authenticator, PGlite) are described in
+[owner-console.md](./owner-console.md).

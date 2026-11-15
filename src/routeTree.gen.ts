@@ -14,6 +14,8 @@ import { Route as DotwellKnownOauthAuthorizationServerRouteImport } from './rout
 import { Route as DotwellKnownOauthProtectedResourceRouteImport } from './routes/[.]well-known/oauth-protected-resource'
 import { Route as ApiMcpRouteImport } from './routes/api/mcp'
 import { Route as CardTokenRouteImport } from './routes/card/$token'
+import { Route as ConsoleIndexRouteImport } from './routes/console/index'
+import { Route as ConsoleSplatRouteImport } from './routes/console/$'
 import { Route as DotwellKnownOauthProtectedResourceSplatRouteImport } from './routes/[.]well-known/oauth-protected-resource/$'
 import { Route as ApiOauthAuthorizeRouteImport } from './routes/api/oauth/authorize'
 import { Route as ApiOauthRegisterRouteImport } from './routes/api/oauth/register'
@@ -47,6 +49,16 @@ const ApiMcpRoute = ApiMcpRouteImport.update({
 const CardTokenRoute = CardTokenRouteImport.update({
   id: '/card/$token',
   path: '/card/$token',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ConsoleIndexRoute = ConsoleIndexRouteImport.update({
+  id: '/console/',
+  path: '/console/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ConsoleSplatRoute = ConsoleSplatRouteImport.update({
+  id: '/console/$',
+  path: '/console/$',
   getParentRoute: () => rootRouteImport,
 } as any)
 const DotwellKnownOauthProtectedResourceSplatRoute =
@@ -92,6 +104,8 @@ export interface FileRoutesByFullPath {
   '/.well-known/oauth-protected-resource': typeof DotwellKnownOauthProtectedResourceRouteWithChildren
   '/api/mcp': typeof ApiMcpRoute
   '/card/$token': typeof CardTokenRoute
+  '/console/$': typeof ConsoleSplatRoute
+  '/console/': typeof ConsoleIndexRoute
   '/.well-known/oauth-protected-resource/$': typeof DotwellKnownOauthProtectedResourceSplatRoute
   '/api/oauth/authorize': typeof ApiOauthAuthorizeRoute
   '/api/oauth/register': typeof ApiOauthRegisterRoute
@@ -106,6 +120,8 @@ export interface FileRoutesByTo {
   '/.well-known/oauth-protected-resource': typeof DotwellKnownOauthProtectedResourceRouteWithChildren
   '/api/mcp': typeof ApiMcpRoute
   '/card/$token': typeof CardTokenRoute
+  '/console/$': typeof ConsoleSplatRoute
+  '/console': typeof ConsoleIndexRoute
   '/.well-known/oauth-protected-resource/$': typeof DotwellKnownOauthProtectedResourceSplatRoute
   '/api/oauth/authorize': typeof ApiOauthAuthorizeRoute
   '/api/oauth/register': typeof ApiOauthRegisterRoute
@@ -121,6 +137,8 @@ export interface FileRoutesById {
   '/.well-known/oauth-protected-resource': typeof DotwellKnownOauthProtectedResourceRouteWithChildren
   '/api/mcp': typeof ApiMcpRoute
   '/card/$token': typeof CardTokenRoute
+  '/console/$': typeof ConsoleSplatRoute
+  '/console/': typeof ConsoleIndexRoute
   '/.well-known/oauth-protected-resource/$': typeof DotwellKnownOauthProtectedResourceSplatRoute
   '/api/oauth/authorize': typeof ApiOauthAuthorizeRoute
   '/api/oauth/register': typeof ApiOauthRegisterRoute
@@ -137,6 +155,8 @@ export interface FileRouteTypes {
     | '/.well-known/oauth-protected-resource'
     | '/api/mcp'
     | '/card/$token'
+    | '/console/$'
+    | '/console/'
     | '/.well-known/oauth-protected-resource/$'
     | '/api/oauth/authorize'
     | '/api/oauth/register'
@@ -151,6 +171,8 @@ export interface FileRouteTypes {
     | '/.well-known/oauth-protected-resource'
     | '/api/mcp'
     | '/card/$token'
+    | '/console/$'
+    | '/console'
     | '/.well-known/oauth-protected-resource/$'
     | '/api/oauth/authorize'
     | '/api/oauth/register'
@@ -165,6 +187,8 @@ export interface FileRouteTypes {
     | '/.well-known/oauth-protected-resource'
     | '/api/mcp'
     | '/card/$token'
+    | '/console/$'
+    | '/console/'
     | '/.well-known/oauth-protected-resource/$'
     | '/api/oauth/authorize'
     | '/api/oauth/register'
@@ -180,6 +204,8 @@ export interface RootRouteChildren {
   DotwellKnownOauthProtectedResourceRoute: typeof DotwellKnownOauthProtectedResourceRouteWithChildren
   ApiMcpRoute: typeof ApiMcpRoute
   CardTokenRoute: typeof CardTokenRoute
+  ConsoleSplatRoute: typeof ConsoleSplatRoute
+  ConsoleIndexRoute: typeof ConsoleIndexRoute
   ApiOauthAuthorizeRoute: typeof ApiOauthAuthorizeRoute
   ApiOauthRegisterRoute: typeof ApiOauthRegisterRoute
   ApiOauthRevokeRoute: typeof ApiOauthRevokeRoute
@@ -223,6 +249,20 @@ declare module '@tanstack/react-router' {
       path: '/card/$token'
       fullPath: '/card/$token'
       preLoaderRoute: typeof CardTokenRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/console/': {
+      id: '/console/'
+      path: '/console'
+      fullPath: '/console/'
+      preLoaderRoute: typeof ConsoleIndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/console/$': {
+      id: '/console/$'
+      path: '/console/$'
+      fullPath: '/console/$'
+      preLoaderRoute: typeof ConsoleSplatRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/.well-known/oauth-protected-resource/$': {
@@ -300,6 +340,8 @@ const rootRouteChildren: RootRouteChildren = {
     DotwellKnownOauthProtectedResourceRouteWithChildren,
   ApiMcpRoute: ApiMcpRoute,
   CardTokenRoute: CardTokenRoute,
+  ConsoleSplatRoute: ConsoleSplatRoute,
+  ConsoleIndexRoute: ConsoleIndexRoute,
   ApiOauthAuthorizeRoute: ApiOauthAuthorizeRoute,
   ApiOauthRegisterRoute: ApiOauthRegisterRoute,
   ApiOauthRevokeRoute: ApiOauthRevokeRoute,

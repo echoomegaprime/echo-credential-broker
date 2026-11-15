@@ -7,6 +7,7 @@ export declare function publicAppHost(hostHeader: string | null | undefined): st
 export declare function resolvePublicHost(hostHeader: string | null | undefined): string;
 export declare function isInstallQuery(url: string | null | undefined): boolean;
 export declare function isDocumentPath(pathname: string | null | undefined): boolean;
+export declare function isVaultSecurePath(pathname: string | null | undefined): boolean;
 export declare function acceptsHtml(accept: string | null | undefined): boolean;
 export declare function stripInstallParams(url: string | null | undefined): string;
 export declare function renderInstallPageHtml(

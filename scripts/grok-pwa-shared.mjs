@@ -124,10 +124,21 @@ export function isInstallQuery(url) {
   return (install === "1" || install === "true") && platform === "ios";
 }
 
-/** Paths that can carry an app document (vs assets / API / internals). */
+/**
+ * Vault pages served under their own strict CSP (the owner console and the
+ * credential cards). They are not app documents: nothing — no script tag, no
+ * manifest link, no banner, no install tutorial — may be added to them.
+ */
+export function isVaultSecurePath(pathname) {
+  const path = String(pathname ?? "");
+  return path === "/console" || path.startsWith("/console/") || path.startsWith("/card/");
+}
+
+/** Paths that can carry an app document (vs assets / API / internals / vault secure pages). */
 export function isDocumentPath(pathname) {
   const path = String(pathname ?? "");
   return (
+    !isVaultSecurePath(path) &&
     !path.startsWith("/__grok/") &&
     !path.startsWith("/api/") &&
     !path.startsWith("/@") &&

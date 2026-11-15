@@ -441,6 +441,12 @@ test("filters non-document paths", () => {
   assert.equal(isDocumentPath("/api/thing"), false);
   assert.equal(isDocumentPath("/__grok/install/styles.css"), false);
   assert.equal(isDocumentPath("/logo.png"), false);
+  // Vault secure pages (strict CSP) never get platform head chrome.
+  for (const path of ["/console", "/console/", "/console/login", "/console/entries", "/card/abc"]) {
+    assert.equal(isDocumentPath(path), false, path);
+  }
+  assert.equal(isDocumentPath("/consoles"), true);
+  assert.equal(isDocumentPath("/cards"), true);
 });
 
 test("strips install params from the app link", () => {

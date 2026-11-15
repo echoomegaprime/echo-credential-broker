@@ -175,7 +175,8 @@ export const PREFIX_REGISTRY: ReadonlyArray<readonly [string, Readonly<Capabilit
   ["payment.", { tier: 3, access: "write" }] as const,
   // Owner-only admin surface (manage clients, consent grants, list entries).
   // Tier 3 so the policy engine denies every client; gateway.ts allows ONLY the
-  // local stdio identity (the owner's own machine). See dispatchTool.
+  // local stdio identity (the owner's own machine) and the owner's passkey
+  // console session. See dispatchTool.
   ["vault.admin.", { tier: 3, access: "write" }] as const,
 ]);
 
