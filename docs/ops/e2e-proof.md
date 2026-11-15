@@ -124,10 +124,9 @@ From the stdio transport on the server host, `audit_list` and `audit_verify` ret
 | `vault.entry.use.read` → `pending_approval` | The first use was held for you. |
 | `vault.entry.use.read` → `ok`, `http 200`, same approval id, `vault://entry/…` | The approved use ran. The reference names the entry; no value is recorded. |
 
-Two things are not ledger rows today:
+Your own decisions:
 
-- **The connection approval** (`vault.client.authorize`). It is recorded in the `vault_approvals` table (status, `decided_by` = your Telegram id, time) and in the server log (`oauth_client_approved`), but not in the hash-chained ledger.
-- **Your taps themselves.** The ledger records the request that was held and the request that ran, with the approval id; who decided and when is in `vault_approvals`.
+- **The connection approval and your taps are on the ledger.** Every decision you make on Telegram writes a `vault.approval.decide` row (client `owner:telegram`, the approval id, what was approved) before it takes effect; if that row cannot be written the tap is refused and the request stays pending. `vault_approvals` additionally keeps `decided_by` and the time.
 
 ## The rehearsal
 

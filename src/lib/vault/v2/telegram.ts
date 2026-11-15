@@ -303,6 +303,9 @@ export async function handleTelegramWebhook(request: Request, opts: WebhookOptio
       edit = outcomeText(result.record, "Expired");
     } else if (result.reason === "not_pending") {
       answer = "Already decided";
+    } else if (result.reason === "ledger_unavailable") {
+      // Nothing was decided: the audit row could not be written. The buttons stay live.
+      answer = "Not recorded - try again";
     } else {
       // unauthorized user, bad MAC, unknown id, misconfiguration: no state change, no edit.
       answer = "Not permitted";

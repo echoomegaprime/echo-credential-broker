@@ -23,7 +23,7 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { log } from "../log.ts";
 import { redactString, registerSecretForRedaction } from "../redaction.ts";
-import type { ApprovalRecord, ApprovalStatus, CapabilityRequest, ConsumeResult } from "./contracts.ts";
+import type { ApprovalRecord, ApprovalStatus, CapabilityRequest, ConsumeResult, LedgerEntryInput } from "./contracts.ts";
 import { requestDigest } from "./policy-engine.ts";
 import type { Sql } from "../../db.ts";
 
@@ -320,7 +320,26 @@ export interface ApprovalOptions {
   /** Expiry; clamped to [30s, 1h]. Default 10 minutes. */
   ttlMs?: number;
   env?: NodeJS.ProcessEnv;
+  /** Ledger sink for the owner's decision. Default: the process-wide sink (the hash-chained ledger). */
+  ledger?: ApprovalLedgerSink;
 }
+
+/** Appends one row to the audit ledger; throws when it cannot be written. */
+export type ApprovalLedgerSink = (input: LedgerEntryInput) => Promise<unknown>;
+
+const productionLedgerSink: ApprovalLedgerSink = async (input) => {
+  const { appendLedger } = await import("./ledger.ts");
+  await appendLedger(input);
+};
+let defaultLedgerSink: ApprovalLedgerSink = productionLedgerSink;
+
+/** Replace the process-wide decision sink (tests); null restores the real ledger. */
+export function setDefaultApprovalLedgerSink(sink: ApprovalLedgerSink | null): void {
+  defaultLedgerSink = sink ?? productionLedgerSink;
+}
+
+/** Capability of the ledger row that records the owner's tap. */
+export const APPROVAL_DECISION_CAPABILITY = "vault.approval.decide";
 
 const defaultNotifier: ApprovalNotifier = async (input) => {
   const { sendApprovalRequest } = await import("./telegram.ts");
@@ -490,7 +509,8 @@ export type DecideRejectReason =
   | "not_found"
   | "bad_mac"
   | "expired"
-  | "not_pending";
+  | "not_pending"
+  | "ledger_unavailable";
 
 export type DecideResult =
   | { ok: true; status: "approved" | "denied"; record: ApprovalRecord }
@@ -551,8 +571,31 @@ export async function decideApproval(
   if (status !== "pending") return reject("not_pending", id, rec);
 
   const next = action === "approve" ? "approved" : "denied";
+  // The owner's decision goes on the hash-chained ledger BEFORE it takes effect,
+  // so nothing is ever approved or denied without an audit row. If the row cannot
+  // be written the tap is refused and the approval stays pending (tap again).
+  const sink = opts.ledger ?? defaultLedgerSink;
+  const decisionRow = (result: "ok" | "denied" | "error", error?: string): LedgerEntryInput => ({
+    client_id: "owner:telegram",
+    capability: APPROVAL_DECISION_CAPABILITY,
+    resource: sanitizeDisplayText(`${rec.capability} ${rec.resource}`, 300),
+    decision: action === "approve" ? "allow" : "deny",
+    tier: 3,
+    result,
+    approval_id: id,
+    error,
+    task: sanitizeDisplayText(`owner ${next} the request of ${rec.client_id}`, 300),
+  });
+  try {
+    await sink(decisionRow(action === "approve" ? "ok" : "denied"));
+  } catch {
+    log.error("vault_approval_decision_unledgered", { approval_id: id });
+    return reject("ledger_unavailable", id, rec);
+  }
   const updated = await store.decide(id, next, telegramUserId, new Date(nowMs).toISOString());
   if (!updated) {
+    // Lost a race (decided or expired in between): say so on the ledger too.
+    await sink(decisionRow("error", "not_applied")).catch(() => undefined);
     const after = (await store.get(id)) ?? rec;
     const s = effectiveStatus(after, nowMs);
     return reject(s === "expired" ? "expired" : "not_pending", id, { ...after, status: s });
