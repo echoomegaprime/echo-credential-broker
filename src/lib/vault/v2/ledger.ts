@@ -185,7 +185,8 @@ function stripControlChars(value: string): string {
   return out;
 }
 
-function redactLedgerText(value: string, opts: { entropy: boolean }): string {
+/** The ledger's own scrubber. Exported so read-side reports (digest.ts) re-apply the SAME rules instead of a copy. */
+export function redactLedgerText(value: string, opts: { entropy: boolean }): string {
   let out = stripControlChars(value);
   for (const [re, replacement] of EXTRA_SECRET_RULES) out = out.replace(re, replacement);
   out = redactString(out);
@@ -392,6 +393,14 @@ export class Ledger {
       client_id: opts.client_id || undefined,
       capability: opts.capability || undefined,
     });
+    return rows.map(publicEntry);
+  }
+
+  /** Entries with seq > afterSeq, ascending, at most `limit` (1..1000). For full-history readers such as digest.ts. */
+  async scan(afterSeq: number, limit: number = VERIFY_BATCH): Promise<LedgerEntry[]> {
+    const after = Number.isFinite(afterSeq) ? Math.max(0, Math.floor(afterSeq)) : 0;
+    const requested = Number.isFinite(limit) ? Math.floor(limit) : VERIFY_BATCH;
+    const rows = await this.store.scanAscending(after, Math.min(Math.max(requested, 1), MAX_LIST_LIMIT));
     return rows.map(publicEntry);
   }
 
@@ -617,6 +626,11 @@ export async function verifyLedger(): Promise<LedgerVerifyResult> {
 
 export async function listLedger(opts: LedgerListOptions = {}): Promise<LedgerEntry[]> {
   return getDefaultLedger().list(opts);
+}
+
+/** Ascending page of the default ledger (seq > afterSeq). */
+export async function scanLedger(afterSeq: number, limit?: number): Promise<LedgerEntry[]> {
+  return getDefaultLedger().scan(afterSeq, limit);
 }
 
 /** Current head, for anchoring outside the database (detects tail truncation). */

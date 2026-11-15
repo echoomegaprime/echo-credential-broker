@@ -103,6 +103,7 @@ import {
   type EntryMetadata,
 } from "./cards.ts";
 import type { CapabilityRequest, ClientIdentity, LedgerEntryInput, PolicyDecision } from "./contracts.ts";
+import { buildDigest, DigestError, formatDigest, resolveDigestWindow, sendDigest, type DigestDeps } from "./digest.ts";
 import { getDefaultEntryGrantStore, listEntryGrants, revokeEntryGrant, type EntryGrantStore } from "./entry-grants.ts";
 import { listClients, revokeClient, setClientScopes } from "./identity.ts";
 import type { GithubAppDeps } from "./github-app.ts";
@@ -172,6 +173,8 @@ export interface GatewayDeps {
   now?: () => number;
   /** Source for ECHO_VAULT_GRANT_* consent-grant config. Default: process.env. */
   env?: NodeJS.ProcessEnv;
+  /** admin_digest_now wiring (ledger source, sent-window state, Telegram fetch). */
+  digest?: DigestDeps;
 }
 
 /** Consent-grant TTL and use cap from the environment (change #1). */
@@ -561,6 +564,16 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = Object.freeze([
     description:
       "OWNER ONLY (local stdio): IRREVERSIBLY destroy an entry — its stored secret, its row, its cards and all consent grants. confirm must be exactly \"PURGE <entry_id>\". Any remote caller is refused (tier 3).",
     inputSchema: schema({ entry_id: { type: "string" }, confirm: { type: "string" } }, ["entry_id", "confirm"]),
+  },
+  {
+    name: "admin_digest_now",
+    description:
+      "OWNER ONLY (local stdio): build the audit digest for a window (default: the previous full UTC day) from ledger rows and entry/grant metadata, and return it. With send=true it is also sent to the owner on Telegram, at most once per window. Any remote caller is refused (tier 3).",
+    inputSchema: schema({
+      from: { type: "string", description: "Window start (inclusive): YYYY-MM-DD (UTC) or an ISO time with Z/offset." },
+      to: { type: "string", description: "Window end (exclusive), same formats." },
+      send: { type: "boolean", description: "Also send it on Telegram. Default false." },
+    }),
   },
   {
     name: "credential_rotate",
@@ -1701,6 +1714,38 @@ const PLANNERS: Readonly<Record<string, Planner>> = Object.freeze({
           return { result: { ok: true, data: await purgeEntry(entryId, rotationDeps(env)) } };
         } catch (err) {
           return { result: entryFailure(err) };
+        }
+      },
+    };
+  },
+  admin_digest_now: (a, env) => {
+    const digestDeps: DigestDeps = {
+      cards: env.deps.cards,
+      grants: env.deps.grants,
+      env: env.deps.env,
+      now: env.deps.now,
+      ...env.deps.digest,
+    };
+    let window;
+    try {
+      window = resolveDigestWindow({ from: optStr(a, "from"), to: optStr(a, "to") }, (digestDeps.now ?? Date.now)());
+    } catch (err) {
+      throw new ToolInputError("invalid_arguments", err instanceof DigestError ? err.message : "invalid window");
+    }
+    const send = a.send === true;
+    return {
+      capability: "vault.admin.digest",
+      resource: clip(`vault:digest/${window.from}/${window.to}`, MAX_RESOURCE),
+      params: { from: window.from, to: window.to, send },
+      summary: "Build the audit digest",
+      run: async () => {
+        try {
+          const digest = await buildDigest(window, digestDeps);
+          const data: Record<string, unknown> = { digest, text: formatDigest(digest) };
+          if (send) data.send = await sendDigest(digest, digestDeps);
+          return { result: { ok: true, data } };
+        } catch (err) {
+          return { result: { ok: false, error: "internal_error", detail: clip(sanitizeError(err).message, 300) } };
         }
       },
     };

@@ -19,6 +19,7 @@ import { ensureV2Configured } from "./bootstrap.ts";
 import { handleCardRequest } from "./card-pages.ts";
 import { MemoryCardStore, MemoryEntryStore, type CardsDeps } from "./cards.ts";
 import type { ClientIdentity } from "./contracts.ts";
+import { MemoryDigestStateStore, type Digest } from "./digest.ts";
 import { MemoryEntryGrantStore, revokeEntryGrant } from "./entry-grants.ts";
 import { MemoryAnchorStore } from "./ledger-anchor.ts";
 import { dispatchTool, isForbiddenToolName, listTools, TOOL_DEFINITIONS, type GatewayDeps, type GatewayResult } from "./gateway.ts";
@@ -1284,6 +1285,8 @@ describe("owner-only admin surface (local stdio)", () => {
       ["admin_purge_entry", { entry_id: `ve_${"0".repeat(32)}`, confirm: `PURGE ve_${"0".repeat(32)}` }],
       ["admin_anchor_now", {}],
       ["admin_verify_anchor", { line: "ECHO-VAULT-ANCHOR v1 seq=1 hash=" + "0".repeat(64) + " rows=1 at=2026-11-14T10:00:00.000Z unsigned" }],
+      ["admin_digest_now", {}],
+      ["admin_digest_now", { from: "2026-11-13", to: "2026-11-14", send: true }],
     ];
     for (const who of [remote, workload]) {
       for (const [name, args] of calls) expectFail(await w.call(who, name, args), "tier3_human_only");
@@ -1291,6 +1294,86 @@ describe("owner-only admin surface (local stdio)", () => {
     assert.equal(w.telegram.length, 0, "a refused admin_anchor_now sends nothing");
     assert.equal(w.anchors.size, 0);
     assert.ok((await w.rows()).every((r) => r.decision === "deny" && r.tier === 3));
+  });
+
+  it("admin_digest_now: oauth and workload identities are denied, build nothing and send nothing", async () => {
+    const w = makeWorld();
+    const state = new MemoryDigestStateStore();
+    const deps: GatewayDeps = { ...w.deps, digest: { ledger: w.ledger, state, fetch: w.deps.approvals?.fetch, env: ENV } };
+    const remote = client("oc_remote", [...SUPPORTED_SCOPES]);
+    const workload = client("workload:svc", [...SUPPORTED_SCOPES], "workload");
+    for (const who of [remote, workload]) {
+      for (const args of [{}, { send: true }, { from: "2026-11-13", send: true }]) {
+        const refused = expectFail(await callWith(who, "admin_digest_now", args, deps), "tier3_human_only");
+        assert.equal("data" in refused, false);
+      }
+    }
+    assert.equal(w.telegram.length, 0, "nothing was sent to Telegram");
+    assert.equal(await state.lastSent(), null);
+    const rows = await w.rows();
+    assert.equal(rows.length, 6);
+    assert.ok(rows.every((r) => r.capability === "vault.admin.digest" && r.decision === "deny" && r.tier === 3 && r.result === "denied"));
+  });
+
+  it("admin_digest_now: the local owner gets the structured digest; send=true sends it once per window", async () => {
+    const w = makeWorld();
+    const agent = client("oc_agent", ["vault.read", "vault.write"]);
+    const secret = "DIGEST-secret-0000000000000000";
+    secretsToScan.add(secret);
+    await seedEntry(w, agent, { site: "dig.com", account: "a", kind: "api_key", secret });
+    const use = { site: "dig.com", account: "a", method: "GET", host: "dig.com", url_path: "/x", task: "read the dashboard" };
+    await firstRead(w, agent, use);
+    expectFail(await w.call(client("oc_other", []), "entry_use", use), "missing_scope");
+    const before = (await w.rows()).length;
+    const sentBefore = w.telegram.length;
+
+    const day = new Date().toISOString().slice(0, 10);
+    const from = `${day}T00:00:00.000Z`;
+    const to = new Date(Date.parse(from) + 86_400_000).toISOString();
+    const deps: GatewayDeps = {
+      ...w.deps,
+      digest: { ledger: w.ledger, state: new MemoryDigestStateStore(), fetch: w.deps.approvals?.fetch, env: ENV },
+    };
+
+    // Build only: nothing is sent.
+    const built = expectOk(await callWith(local, "admin_digest_now", { from: day }, deps));
+    const digest = built.digest as Digest;
+    assert.deepEqual(digest.window, { from, to });
+    assert.equal(digest.total_actions, before);
+    assert.deepEqual(digest.chain, { ok: true, count: before });
+    assert.equal(digest.grants.created, 1);
+    assert.equal(digest.approvals.requested, 1);
+    assert.equal(digest.approvals.granted, 1);
+    assert.ok(digest.clients.some((c) => c.client_id === "oc_agent" && c.entries_used === 1));
+    assert.ok(digest.anomalies.new_clients.some((c) => c.client_id === "oc_other"));
+    assert.equal(typeof built.text, "string");
+    assert.match(String(built.text), /^ECHO Vault daily digest\n/);
+    assert.equal("send" in built, false);
+    assert.equal(w.telegram.length, sentBefore);
+
+    // send=true: one Telegram message, then already_sent.
+    const sent = expectOk(await callWith(local, "admin_digest_now", { from: day, send: true }, deps));
+    assert.equal((sent.send as { sent: boolean }).sent, true);
+    assert.equal(w.telegram.length, sentBefore + 1);
+    const message = w.telegram[w.telegram.length - 1];
+    assert.equal(message.method, "sendMessage");
+    assert.equal(message.payload.text, sent.text);
+    assert.equal("reply_markup" in message.payload, false);
+    const again = expectOk(await callWith(local, "admin_digest_now", { from: day, send: true }, deps));
+    assert.deepEqual(again.send, { sent: false, reason: "already_sent", window: { from, to } });
+    assert.equal(w.telegram.length, sentBefore + 1, "no second message");
+
+    // The default window is the previous UTC day: nothing happened then.
+    const yesterday = expectOk(await callWith(local, "admin_digest_now", {}, deps)).digest as Digest;
+    assert.equal(yesterday.window.to, from);
+    assert.equal(yesterday.total_actions, 0);
+
+    // Bad input is refused before anything runs; the admin calls themselves are ledgered.
+    expectFail(await callWith(local, "admin_digest_now", { from: "2026-11-13T00:00:00" }, deps), "invalid_arguments");
+    expectFail(await callWith(local, "admin_digest_now", { send: "yes" }, deps), "invalid_arguments");
+    expectFail(await callWith(local, "admin_digest_now", { body: "x" }, deps), "invalid_arguments");
+    assert.ok((await w.rows()).some((r) => r.client_id === "local:owner" && r.capability === "vault.admin.digest" && r.result === "ok"));
+    assert.equal(JSON.stringify([built, sent]).includes("vault://"), false, "no credential ref in the digest");
   });
 
   it("admin_revoke_grant forces the client's next read to re-prompt; admin_list_entries shows full metadata", async () => {
