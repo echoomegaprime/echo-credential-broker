@@ -116,6 +116,7 @@ import {
 import { appendLedger, ledgerHead, listLedger, verifyLedger, type LedgerVerifyResult } from "./ledger.ts";
 import { purgeEntry, rotateEntry, setEntryRotation, type RotationDeps } from "./rotation.ts";
 import { pinnedFetch, type PinnedFetch } from "./pinned-fetch.ts";
+import { anchorHead, newestAnchorVerdict, verifyAnchorLine, type AnchorDeps } from "./ledger-anchor.ts";
 import {
   evaluatePolicy,
   lookupCapability,
@@ -145,6 +146,8 @@ export interface GatewayDeps {
   listLedger?: typeof listLedger;
   verifyLedger?: () => Promise<LedgerVerifyResult>;
   ledgerHead?: typeof ledgerHead;
+  /** Ledger anchoring (ledger-anchor.ts): ledger instance, anchor index, Telegram fetch, env. */
+  anchor?: AnchorDeps;
   /** Approval store / notifier / clock / env. */
   approvals?: ApprovalOptions;
   /** Policy rules. Default: ECHO_VAULT_POLICY_FILE or the built-in rules. */
@@ -458,8 +461,21 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = Object.freeze([
   },
   {
     name: "audit_verify",
-    description: "Recompute the ledger's hash chain and report whether it is intact. Tier 0, scope audit.read.",
+    description:
+      "Recompute the ledger's hash chain and report whether it is intact, plus how the ledger compares with the newest externally anchored head (`anchor.verdict`: ok / truncated / rewritten / anchor_mac_invalid; `anchor: null` when nothing was anchored yet). Tier 0, scope audit.read.",
     inputSchema: schema({}),
+  },
+  {
+    name: "admin_anchor_now",
+    description:
+      "OWNER ONLY (local stdio): verify the ledger and publish its head (seq, chain hash, row count) to the owner's Telegram chat as an external anchor. Sends nothing when the head has not moved. Any remote caller is refused (tier 3).",
+    inputSchema: schema({}),
+  },
+  {
+    name: "admin_verify_anchor",
+    description:
+      "OWNER ONLY (local stdio): check an `ECHO-VAULT-ANCHOR v1 …` line copied from Telegram against the current ledger. Verdict: ok / truncated / rewritten / anchor_mac_invalid / anchor_ahead_of_ledger. Any remote caller is refused (tier 3).",
+    inputSchema: schema({ line: { type: "string", maxLength: 400, description: "The full anchor message text." } }, ["line"]),
   },
   {
     name: "admin_list_clients",
@@ -1458,9 +1474,47 @@ const PLANNERS: Readonly<Record<string, Planner>> = Object.freeze({
     run: async () => {
       const verification = await (env.deps.verifyLedger ?? verifyLedger)();
       const head = await (env.deps.ledgerHead ?? ledgerHead)();
-      return { result: { ok: true, data: { ...verification, head } } };
+      // Newest external anchor vs the ledger as it is now. A failure to read the anchor index is reported, never hidden as "ok".
+      let anchor: Awaited<ReturnType<typeof newestAnchorVerdict>> = null;
+      let anchorError: string | undefined;
+      try {
+        anchor = await newestAnchorVerdict(env.deps.anchor, verification.ok ? verification.count : undefined);
+      } catch {
+        anchorError = "anchor_check_unavailable";
+      }
+      return { result: { ok: true, data: { ...verification, head, anchor, ...(anchorError ? { anchor_error: anchorError } : {}) } } };
     },
   }),
+  admin_anchor_now: (_a, env) => ({
+    capability: "vault.admin.ledger.anchor",
+    resource: "ledger:anchor",
+    params: {},
+    summary: "Anchor the ledger head to Telegram",
+    run: async () => {
+      const outcome = await anchorHead(env.deps.anchor);
+      if (outcome.ok) return { result: { ok: true, data: outcome } };
+      const { ok: _ok, ...failure } = outcome;
+      return { result: { ok: false, ...failure } };
+    },
+  }),
+  admin_verify_anchor: (a, env) => {
+    const line = reqStr(a, "line");
+    return {
+      capability: "vault.admin.ledger.verify_anchor",
+      resource: "ledger:anchor",
+      params: {},
+      summary: "Check an anchor line against the ledger",
+      run: async () => {
+        try {
+          const check = await verifyAnchorLine(line, env.deps.anchor);
+          if (!check) return { result: { ok: false, error: "anchor_line_invalid" } };
+          return { result: { ok: true, data: check } };
+        } catch (err) {
+          return { result: { ok: false, error: "internal_error", detail: clip(sanitizeError(err).message, 300) } };
+        }
+      },
+    };
+  },
   // Owner-only admin surface (local stdio identity only; see dispatchTool).
   admin_list_clients: (_a, _env) => ({
     capability: "vault.admin.clients.list",
