@@ -20,7 +20,9 @@
     "scan:credentials": "node scripts/credential-scan.mjs",
     "mcp": "node --experimental-strip-types scripts/mcp-stdio.ts",
     "lint": "eslint .",
-    "format": "prettier --write ."
+    "format": "prettier --write .",
+    "e2e:rehearsal": "node scripts/e2e/rehearsal.mjs",
+    "e2e:proof": "node scripts/e2e/proof-client.mjs"
   },
   "dependencies": {
     "@electric-sql/pglite": "^0.5.4",
