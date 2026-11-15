@@ -41,6 +41,9 @@ describe("pathUnderPrefix", () => {
   it("matches the exact path and anything under it, but not a sibling", () => {
     assert.equal(pathUnderPrefix("/user/repos", "/user/repos"), true);
     assert.equal(pathUnderPrefix("/user/repos/123", "/user/repos"), true);
+    // The root is not a wildcard: a grant for "/" covers "/" and nothing under it.
+    assert.equal(pathUnderPrefix("/", "/"), true);
+    assert.equal(pathUnderPrefix("/user", "/"), false);
     assert.equal(pathUnderPrefix("/user/reposX", "/user/repos"), false);
     assert.equal(pathUnderPrefix("/user", "/user/repos"), false);
     assert.equal(pathUnderPrefix("/user/emails", "/user/repos"), false);

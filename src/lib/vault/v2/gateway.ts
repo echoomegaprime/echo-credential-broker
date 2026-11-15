@@ -1175,7 +1175,7 @@ async function entryUsePlan(a: Record<string, unknown>, env: Env): Promise<Plan>
     const { ttlMs, maxUses } = grantConfig(env.deps.env);
     const expiresIso = new Date((env.deps.now ?? Date.now)() + ttlMs).toISOString();
     const scopeLine =
-      `Approving also lets this client make GET/HEAD requests to https://${host}${clip(grantPath, 160)}(/*) with this entry, ` +
+      `Approving also lets this client make GET/HEAD requests to https://${host}${clip(grantPath, 160)}${grantPath === "/" ? " (that exact path only)" : "(/*)"} with this entry, ` +
       `without asking again, until ${expiresIso}${maxUses === null ? "" : ` or ${maxUses} uses`}.`;
     summary = `FIRST USE of "${entry.label}" by this client: ${what}. Task: ${task}. ${scopeLine}`;
   } else {
