@@ -24,6 +24,10 @@ import {
   setClientScopes,
   wwwAuthenticateHeader,
 } from "./identity.ts";
+import { MemoryRateLimitStore, setDefaultRateLimitStore } from "./rate-limit-store.ts";
+
+// Failed-attempt counts default to the shared SQL store; this file keeps them in memory.
+setDefaultRateLimitStore(new MemoryRateLimitStore());
 
 // Keep the vault logger's stderr lines out of the test report.
 const origStderrWrite = process.stderr.write.bind(process.stderr);

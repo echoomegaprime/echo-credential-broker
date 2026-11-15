@@ -6,13 +6,18 @@ import { join } from "node:path";
 import { after, afterEach, describe, it } from "node:test";
 import type { CapabilityRequest, ClientIdentity } from "./contracts.ts";
 import {
+  enforceRateLimits,
   evaluatePolicy,
+  evaluatePolicyWithRateLimits,
   loadPolicyRules,
   PolicyConfigError,
+  policyRateLimitKey,
   requestDigest,
   requiredScope,
+  resetRateLimits,
   SlidingWindowRateLimiter,
 } from "./policy-engine.ts";
+import { MemoryRateLimitStore, setDefaultRateLimitStore, type RateLimitStore } from "./rate-limit-store.ts";
 import type { PolicyRule } from "./policy-engine.ts";
 
 const ALL_SCOPES = [
@@ -223,37 +228,187 @@ describe("policy engine: per-client rules", () => {
     assert.equal(evaluatePolicy(req("audit.read", "audit:all"), rules).decision, "allow");
   });
 
-  it("rate limit uses a sliding one-hour window with an injectable clock", () => {
-    const limiter = new SlidingWindowRateLimiter();
+  it("rate limit uses a sliding one-hour window with an injectable clock", async () => {
+    const limiter = new SlidingWindowRateLimiter(undefined, new MemoryRateLimitStore());
     let now = 1_000_000;
     const opts = { limiter, now: () => now };
     const rules: PolicyRule[] = [{ id: "rl", client_id: "oc_test", capability: "github.repo.read", max_per_hour: 2 }];
-    assert.equal(evaluatePolicy(req("github.repo.read"), rules, opts).decision, "allow");
+    assert.equal((await evaluatePolicyWithRateLimits(req("github.repo.read"), rules, opts)).decision, "allow");
     now += 10 * 60 * 1000;
-    assert.equal(evaluatePolicy(req("github.repo.read"), rules, opts).decision, "allow");
+    assert.equal((await evaluatePolicyWithRateLimits(req("github.repo.read"), rules, opts)).decision, "allow");
     now += 10 * 60 * 1000;
-    const limited = evaluatePolicy(req("github.repo.read"), rules, opts);
+    const limited = await evaluatePolicyWithRateLimits(req("github.repo.read"), rules, opts);
     assert.equal(limited.decision, "deny");
     assert.equal(limited.reason, "rate_limited");
     assert.equal(limited.rule_id, "rl");
     // Other clients have their own window.
     const other = req("github.repo.read", "github:o/r", {}, client(ALL_SCOPES, "oc_test"));
-    assert.equal(evaluatePolicy({ ...other, client: { ...other.client, client_id: "oc_x" } }, rules, opts).decision, "allow");
+    assert.equal(
+      (await evaluatePolicyWithRateLimits({ ...other, client: { ...other.client, client_id: "oc_x" } }, rules, opts)).decision,
+      "allow",
+    );
     // First hit leaves the window after an hour.
     now = 1_000_000 + 60 * 60 * 1000 + 1;
-    assert.equal(evaluatePolicy(req("github.repo.read"), rules, opts).decision, "allow");
-    assert.equal(evaluatePolicy(req("github.repo.read"), rules, opts).decision, "deny");
+    assert.equal((await evaluatePolicyWithRateLimits(req("github.repo.read"), rules, opts)).decision, "allow");
+    assert.equal((await evaluatePolicyWithRateLimits(req("github.repo.read"), rules, opts)).decision, "deny");
   });
 
-  it("denied requests do not consume rate-limit slots", () => {
-    const limiter = new SlidingWindowRateLimiter();
+  it("denied requests do not consume rate-limit slots", async () => {
+    const limiter = new SlidingWindowRateLimiter(undefined, new MemoryRateLimitStore());
     const opts = { limiter, now: () => 5 };
     const rules: PolicyRule[] = [
       { client_id: "*", capability: "github.*", max_per_hour: 1, resources: ["github:ok/*"] },
     ];
-    assert.equal(evaluatePolicy(req("github.repo.read", "github:bad/x"), rules, opts).reason, "resource_not_allowed");
-    assert.equal(evaluatePolicy(req("github.repo.read", "github:ok/x"), rules, opts).decision, "allow");
-    assert.equal(evaluatePolicy(req("github.repo.read", "github:ok/x"), rules, opts).reason, "rate_limited");
+    assert.equal((await evaluatePolicyWithRateLimits(req("github.repo.read", "github:bad/x"), rules, opts)).reason, "resource_not_allowed");
+    assert.equal((await evaluatePolicyWithRateLimits(req("github.repo.read", "github:ok/x"), rules, opts)).decision, "allow");
+    assert.equal((await evaluatePolicyWithRateLimits(req("github.repo.read", "github:ok/x"), rules, opts)).reason, "rate_limited");
+  });
+});
+
+describe("policy engine: shared rate-limit store", () => {
+  const RL: PolicyRule[] = [{ id: "rl", client_id: "*", capability: "*", max_per_hour: 2 }];
+
+  class DownStore implements RateLimitStore {
+    readonly kind = "sql" as const;
+    calls = 0;
+    private fail(): never {
+      this.calls += 1;
+      throw new Error("db down");
+    }
+    async hit(): Promise<never> {
+      return this.fail();
+    }
+    async count(): Promise<never> {
+      return this.fail();
+    }
+    async reset(): Promise<never> {
+      return this.fail();
+    }
+    async prune(): Promise<never> {
+      return this.fail();
+    }
+  }
+
+  it("evaluatePolicy alone is synchronous and never applies max_per_hour; enforceRateLimits is the awaited step", async () => {
+    const limiter = new SlidingWindowRateLimiter(undefined, new MemoryRateLimitStore());
+    const opts = { limiter, now: () => 1 };
+    const rules: PolicyRule[] = [{ id: "rl", client_id: "*", capability: "*", max_per_hour: 0 }];
+    const base = evaluatePolicy(req("github.repo.read"), rules);
+    assert.equal(base.decision, "allow");
+    const limited = await enforceRateLimits(req("github.repo.read"), base, rules, opts);
+    assert.deepEqual(limited, { decision: "deny", tier: 0, reason: "rate_limited", rule_id: "rl" });
+    // A deny from the earlier steps passes through untouched.
+    const denied = evaluatePolicy(req("vault.secret.reveal"), rules);
+    assert.equal(await enforceRateLimits(req("vault.secret.reveal"), denied, rules, opts), denied);
+  });
+
+  it("two limiters over one store share the budget (several server instances)", async () => {
+    const store = new MemoryRateLimitStore();
+    const a = { limiter: new SlidingWindowRateLimiter(undefined, store), now: () => 10 };
+    const b = { limiter: new SlidingWindowRateLimiter(undefined, store), now: () => 11 };
+    assert.equal((await evaluatePolicyWithRateLimits(req("github.repo.read"), RL, a)).decision, "allow");
+    assert.equal((await evaluatePolicyWithRateLimits(req("github.repo.read"), RL, b)).decision, "allow");
+    assert.equal((await evaluatePolicyWithRateLimits(req("github.repo.read"), RL, a)).reason, "rate_limited");
+    assert.equal((await evaluatePolicyWithRateLimits(req("github.repo.read"), RL, b)).reason, "rate_limited");
+  });
+
+  it("the budget survives a restart (a new limiter over the same store)", async () => {
+    const store = new MemoryRateLimitStore();
+    const before = { limiter: new SlidingWindowRateLimiter(undefined, store), now: () => 10 };
+    await evaluatePolicyWithRateLimits(req("github.repo.read"), RL, before);
+    await evaluatePolicyWithRateLimits(req("github.repo.read"), RL, before);
+    const afterRestart = { limiter: new SlidingWindowRateLimiter(undefined, store), now: () => 20 };
+    assert.equal((await evaluatePolicyWithRateLimits(req("github.repo.read"), RL, afterRestart)).reason, "rate_limited");
+  });
+
+  it("parallel requests never take more than max_per_hour slots, and escalations count too", async () => {
+    const store = new MemoryRateLimitStore();
+    const opts = { limiter: new SlidingWindowRateLimiter(undefined, store), now: () => 10 };
+    const rules: PolicyRule[] = [{ id: "rl", client_id: "*", capability: "*", max_per_hour: 5 }];
+    const decisions = await Promise.all(
+      Array.from({ length: 20 }, (_, i) =>
+        evaluatePolicyWithRateLimits(req(i % 2 ? "github.repo.read" : "github.pr.merge"), rules, opts),
+      ),
+    );
+    assert.equal(decisions.filter((d) => d.decision !== "deny").length, 5);
+    assert.ok(decisions.filter((d) => d.decision === "deny").every((d) => d.reason === "rate_limited" && d.rule_id === "rl"));
+  });
+
+  it("with several limited rules the first exhausted one is reported and no slot is consumed", async () => {
+    const store = new MemoryRateLimitStore();
+    const opts = { limiter: new SlidingWindowRateLimiter(undefined, store), now: () => 10 };
+    const rules: PolicyRule[] = [
+      { id: "wide", client_id: "*", capability: "*", max_per_hour: 5 },
+      { id: "narrow", client_id: "oc_test", capability: "github.repo.read", max_per_hour: 1 },
+    ];
+    assert.equal((await evaluatePolicyWithRateLimits(req("github.repo.read"), rules, opts)).decision, "allow");
+    const second = await evaluatePolicyWithRateLimits(req("github.repo.read"), rules, opts);
+    assert.equal(second.reason, "rate_limited");
+    assert.equal(second.rule_id, "narrow");
+    // The refused request did not take a "wide" slot: 1 of 5 used.
+    assert.equal((await store.count(policyRateLimitKey("wide", "oc_test"), 3_600_000, 10)).count, 1);
+  });
+
+  it("store keys are hashes: neither the rule id nor the client id is stored", async () => {
+    const store = new MemoryRateLimitStore();
+    const opts = { limiter: new SlidingWindowRateLimiter(undefined, store), now: () => 10 };
+    await evaluatePolicyWithRateLimits(req("github.repo.read"), RL, opts);
+    assert.deepEqual(store.keys(), [policyRateLimitKey("rl", "oc_test")]);
+    assert.match(store.keys()[0], /^policy:[0-9a-f]{64}$/);
+  });
+
+  it("store unavailable → deny rate_limit_unavailable at every tier (fail closed), logged without the key", async () => {
+    const down = new DownStore();
+    const opts = { limiter: new SlidingWindowRateLimiter(undefined, down), now: () => 10 };
+    const original = process.stderr.write.bind(process.stderr);
+    let logged = "";
+    process.stderr.write = ((chunk: string | Uint8Array) => {
+      logged += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      const cases: Array<[string, Record<string, unknown>, number]> = [
+        ["github.repo.read", {}, 0],
+        ["vault.entry.use.read", {}, 0],
+        ["github.branch.create", {}, 1],
+        ["github.pr.merge", {}, 2],
+      ];
+      for (const [cap, params, tier] of cases) {
+        const d = await evaluatePolicyWithRateLimits(req(cap, "github:o/r", params), RL, opts);
+        assert.deepEqual(d, { decision: "deny", tier, reason: "rate_limit_unavailable", rule_id: "rl" });
+      }
+    } finally {
+      process.stderr.write = original;
+    }
+    assert.equal(down.calls, 4);
+    assert.match(logged, /policy_rate_limit_unavailable/);
+    assert.equal(logged.includes(policyRateLimitKey("rl", "oc_test")), false);
+  });
+
+  it("a request no max_per_hour rule applies to never touches the store, so an outage cannot affect it", async () => {
+    const down = new DownStore();
+    const opts = { limiter: new SlidingWindowRateLimiter(undefined, down), now: () => 10 };
+    const rules: PolicyRule[] = [{ id: "rl", client_id: "oc_other", capability: "*", max_per_hour: 1 }];
+    assert.equal((await evaluatePolicyWithRateLimits(req("github.repo.read"), rules, opts)).decision, "allow");
+    assert.equal((await evaluatePolicyWithRateLimits(req("github.pr.merge"), [], opts)).decision, "escalate");
+    // Requests denied by an earlier step do not reach the store either.
+    assert.equal((await evaluatePolicyWithRateLimits(req("vault.secret.reveal"), RL, opts)).reason, "tier3_human_only");
+    assert.equal(down.calls, 0);
+  });
+
+  it("resetRateLimits only clears an installed in-memory store", async () => {
+    const store = new MemoryRateLimitStore();
+    setDefaultRateLimitStore(store);
+    try {
+      await evaluatePolicyWithRateLimits(req("github.repo.read"), RL, { now: () => 10 });
+      assert.equal(store.keys().length, 1);
+      resetRateLimits();
+      assert.equal(store.keys().length, 0);
+      setDefaultRateLimitStore(new DownStore());
+      assert.throws(() => resetRateLimits(), /test hook/);
+    } finally {
+      setDefaultRateLimitStore(null);
+    }
   });
 });
 

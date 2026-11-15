@@ -34,6 +34,15 @@ import type { ClientIdentity } from "./contracts.ts";
 import { log } from "../log.ts";
 import { registerSecretForRedaction, sanitizeError } from "../redaction.ts";
 import {
+  MAX_EVENTS_PER_KEY,
+  MemoryRateLimitStore,
+  RateLimitUnavailableError,
+  getDefaultRateLimitStore,
+  rateLimitKey,
+  withRateLimitStore,
+  type RateLimitStore,
+} from "./rate-limit-store.ts";
+import {
   getOAuthStore,
   type OAuthClientRecord,
   type OAuthStore,
@@ -220,50 +229,55 @@ export function resolveOAuthConfig(env: Env = process.env): OAuthConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Failed-attempt rate limiter (in-process, injectable clock)
+// Failed-attempt rate limiter (shared RateLimitStore, injectable clock)
 // ---------------------------------------------------------------------------
 
+/**
+ * Counts failed attempts per key in a sliding window. State lives in a
+ * RateLimitStore (default: the shared SQL store), so the limit survives a
+ * restart and holds across server instances. Every method rejects with
+ * RateLimitUnavailableError when the store fails; callers fail closed.
+ */
 export class FailureRateLimiter {
-  private readonly hits = new Map<string, number[]>();
   private readonly now: () => number;
   readonly maxFailures: number;
   readonly windowMs: number;
-  private readonly maxKeys: number;
+  private readonly store: RateLimitStore | undefined;
 
-  constructor(opts: { now: () => number; maxFailures?: number; windowMs?: number; maxKeys?: number }) {
+  constructor(opts: {
+    now: () => number;
+    maxFailures?: number;
+    windowMs?: number;
+    /** Only used when no `store` is given: a private in-memory store capped at this many keys. */
+    maxKeys?: number;
+    /** Default: getDefaultRateLimitStore() (resolved per call). */
+    store?: RateLimitStore;
+  }) {
     this.now = opts.now;
-    this.maxFailures = opts.maxFailures ?? 10;
+    this.maxFailures = Math.min(opts.maxFailures ?? 10, MAX_EVENTS_PER_KEY);
     this.windowMs = opts.windowMs ?? 5 * 60 * 1000;
-    this.maxKeys = opts.maxKeys ?? 10_000;
+    this.store = opts.store ?? (opts.maxKeys !== undefined ? new MemoryRateLimitStore({ maxKeys: opts.maxKeys }) : undefined);
   }
 
-  private live(key: string): number[] {
-    const cutoff = this.now() - this.windowMs;
-    const list = (this.hits.get(key) ?? []).filter((t) => t > cutoff);
-    if (list.length) this.hits.set(key, list);
-    else this.hits.delete(key);
-    return list;
+  private backing(): RateLimitStore {
+    return this.store ?? getDefaultRateLimitStore();
   }
 
   /** 0 when allowed; otherwise milliseconds until the oldest failure leaves the window. */
-  retryAfterMs(key: string): number {
-    const list = this.live(key);
-    if (list.length < this.maxFailures) return 0;
-    return Math.max(1, list[0] + this.windowMs - this.now());
+  async retryAfterMs(key: string): Promise<number> {
+    const now = this.now();
+    const { count, oldestAt } = await withRateLimitStore(this.backing(), "count", (s) => s.count(key, this.windowMs, now));
+    if (count < this.maxFailures || oldestAt === null) return 0;
+    return Math.max(1, oldestAt + this.windowMs - now);
   }
 
-  recordFailure(key: string): void {
-    const list = this.live(key);
-    list.push(this.now());
-    if (!this.hits.has(key) && this.hits.size >= this.maxKeys) {
-      const oldest = this.hits.keys().next().value;
-      if (oldest !== undefined) this.hits.delete(oldest);
-    }
-    this.hits.set(key, list);
+  async recordFailure(key: string): Promise<void> {
+    const now = this.now();
+    await withRateLimitStore(this.backing(), "hit", (s) => s.hit(key, this.windowMs, now));
   }
 
-  reset(key: string): void {
-    this.hits.delete(key);
+  async reset(key: string): Promise<void> {
+    await withRateLimitStore(this.backing(), "reset", (s) => s.reset(key));
   }
 }
 
@@ -277,6 +291,8 @@ export interface OAuthDeps {
   clock?: Clock;
   env?: Env;
   rateLimit?: { maxFailures?: number; windowMs?: number };
+  /** Where failed-attempt counts live. Default: the shared SQL store. Tests pass a MemoryRateLimitStore. */
+  rateLimitStore?: RateLimitStore;
 }
 
 interface OAuthContext {
@@ -285,6 +301,7 @@ interface OAuthContext {
   clock: Clock;
   env: Env;
   limiter: FailureRateLimiter;
+  rateLimitStore: RateLimitStore | undefined;
   lastPurge: number;
 }
 
@@ -297,6 +314,7 @@ function newContext(): OAuthContext {
     clock: { now: () => Date.now() },
     env: process.env,
     limiter: undefined as unknown as FailureRateLimiter,
+    rateLimitStore: undefined,
     lastPurge: 0,
   };
   ctx.limiter = new FailureRateLimiter({ now: () => ctx.clock.now() });
@@ -319,8 +337,9 @@ export function configureOAuth(deps: OAuthDeps): void {
   if (deps.approver !== undefined) c.approver = deps.approver;
   if (deps.clock !== undefined) c.clock = deps.clock;
   if (deps.env !== undefined) c.env = deps.env;
-  if (deps.rateLimit !== undefined || deps.clock !== undefined) {
-    c.limiter = new FailureRateLimiter({ now: () => c.clock.now(), ...deps.rateLimit });
+  if (deps.rateLimitStore !== undefined) c.rateLimitStore = deps.rateLimitStore;
+  if (deps.rateLimit !== undefined || deps.clock !== undefined || deps.rateLimitStore !== undefined) {
+    c.limiter = new FailureRateLimiter({ now: () => c.clock.now(), ...deps.rateLimit, store: c.rateLimitStore });
   }
 }
 
@@ -1078,8 +1097,49 @@ function tokenClientId(req: Request, params: URLSearchParams): { client_id: stri
   return { client_id: id };
 }
 
-function limiterKey(clientId: string): string {
-  return CLIENT_ID_RE.test(clientId) ? `client:${clientId}` : "client:malformed";
+/**
+ * Rate-limit key for one client's failed token attempts. Derived only from the
+ * client_id (never the code, verifier or token presented) and hashed by
+ * rateLimitKey, so nothing the caller sent is stored. A malformed client_id —
+ * which could be anything, a pasted token included — collapses to one bucket.
+ */
+export function limiterKey(clientId: string): string {
+  return rateLimitKey("oauth.token", CLIENT_ID_RE.test(clientId) ? clientId : "malformed");
+}
+
+/** 503 for a token request that cannot be rate-checked: failed-attempt limits fail closed. */
+function rateLimitUnavailable(): Response {
+  return oauthError("temporarily_unavailable", "rate_limit_unavailable: failed-attempt limits cannot be checked; retry later", 503, {
+    "retry-after": "5",
+  });
+}
+
+/**
+ * Count one failed attempt. The request is already being refused, so a store
+ * failure here is logged (withRateLimitStore) and does not change the answer;
+ * the next request fails closed at the check in handleToken.
+ */
+async function noteFailure(key: string): Promise<void> {
+  try {
+    await ctx().limiter.recordFailure(key);
+  } catch (err) {
+    if (!(err instanceof RateLimitUnavailableError)) throw err;
+    log.error("oauth_rate_limit_unavailable", { op: "record_failure" });
+  }
+}
+
+/**
+ * Forget a client's failures after a successful grant. The grant has already
+ * been consumed, so a store failure must not lose the issued tokens: it is
+ * logged and the stale failures simply keep counting (stricter, never looser).
+ */
+async function clearFailures(key: string): Promise<void> {
+  try {
+    await ctx().limiter.reset(key);
+  } catch (err) {
+    if (!(err instanceof RateLimitUnavailableError)) throw err;
+    log.error("oauth_rate_limit_unavailable", { op: "reset" });
+  }
 }
 
 export async function handleToken(req: Request): Promise<Response> {
@@ -1101,7 +1161,14 @@ export async function handleToken(req: Request): Promise<Response> {
 
     const c = ctx();
     const key = limiterKey(who.client_id);
-    const retryMs = c.limiter.retryAfterMs(key);
+    let retryMs: number;
+    try {
+      retryMs = await c.limiter.retryAfterMs(key);
+    } catch (err) {
+      if (!(err instanceof RateLimitUnavailableError)) throw err;
+      log.error("oauth_rate_limit_unavailable", { op: "check", client_id: who.client_id.slice(0, 64) });
+      return rateLimitUnavailable();
+    }
     if (retryMs > 0) {
       log.warn("oauth_token_rate_limited", { client_id: who.client_id.slice(0, 64) });
       return oauthError("temporarily_unavailable", "too many failed attempts; retry later", 429, {
@@ -1128,8 +1195,8 @@ export async function handleToken(req: Request): Promise<Response> {
   }
 }
 
-function invalidGrant(key: string, description: string): Response {
-  ctx().limiter.recordFailure(key);
+async function invalidGrant(key: string, description: string): Promise<Response> {
+  await noteFailure(key);
   return oauthError("invalid_grant", description);
 }
 
@@ -1148,7 +1215,7 @@ async function authorizationCodeGrant(
 
   const client = CLIENT_ID_RE.test(clientId) ? await store.getClient(clientId) : null;
   if (!client) {
-    ctx().limiter.recordFailure(key);
+    await noteFailure(key);
     return oauthError("invalid_client", "unknown client", 401);
   }
   if (!CODE_RE.test(code)) return invalidGrant(key, "invalid authorization code");
@@ -1178,7 +1245,7 @@ async function authorizationCodeGrant(
   const scopes = intersectScopes(rec.scopes, client.granted_scopes);
   if (scopes.length === 0) return oauthError("invalid_scope", "no granted scopes remain for this client");
 
-  ctx().limiter.reset(key);
+  await clearFailures(key);
   return issueTokens(store, now, {
     client_id: client.client_id,
     family_id: rec.family_id,
@@ -1199,7 +1266,7 @@ async function refreshTokenGrant(
   if (!presented) return oauthError("invalid_request", "refresh_token is required");
   const client = CLIENT_ID_RE.test(clientId) ? await store.getClient(clientId) : null;
   if (!client) {
-    ctx().limiter.recordFailure(key);
+    await noteFailure(key);
     return oauthError("invalid_client", "unknown client", 401);
   }
   if (!REFRESH_TOKEN_RE.test(presented)) return invalidGrant(key, "invalid refresh token");
@@ -1229,7 +1296,7 @@ async function refreshTokenGrant(
     log.warn("oauth_refresh_reuse_detected", { client_id: rec.client_id, family_id: rec.family_id, tokens_revoked: revoked });
     return invalidGrant(key, "refresh token was already used");
   }
-  ctx().limiter.reset(key);
+  await clearFailures(key);
   return issueTokens(store, now, {
     client_id: client.client_id,
     family_id: rec.family_id,

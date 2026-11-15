@@ -2,7 +2,14 @@
 /**
  * Vault v2 policy engine — decides allow / escalate / deny for one
  * CapabilityRequest. Pure apart from (a) reading the optional policy file named
- * by ECHO_VAULT_POLICY_FILE and (b) an in-process sliding-window rate limiter.
+ * by ECHO_VAULT_POLICY_FILE and (b) the shared sliding-window rate limiter
+ * (state lives in a RateLimitStore — rate-limit-store.ts — so it survives
+ * restarts and holds across server instances).
+ *
+ * `evaluatePolicy` is synchronous and performs steps 1-6 and 8. Step 7 needs
+ * the store, so it is the separate awaited `enforceRateLimits`;
+ * `evaluatePolicyWithRateLimits` runs both in order. A caller that uses
+ * `evaluatePolicy` alone does NOT enforce max_per_hour.
  *
  * Order of evaluation (first failing step wins):
  *   1. request shape            → deny "invalid_request"
@@ -14,7 +21,10 @@
  *   5. scope                    → deny "missing_scope"
  *   6. rule resource allowlist  → deny "resource_not_allowed"
  *   7. rule max_per_hour        → deny "rate_limited" (a slot is only consumed
- *                                  when every other check passed)
+ *                                  when every other check passed); when the
+ *                                  store is unreachable → deny
+ *                                  "rate_limit_unavailable" at EVERY tier,
+ *                                  tier 0 included (fail closed)
  *   8. tier 0/1 → allow, tier 2 → escalate (Telegram approval, approvals.ts)
  *
  * Scope mapping (documented contract for identity.ts / OAuth grants):
@@ -46,6 +56,16 @@ import { createHash } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 import { canonicalJson } from "./contracts.ts";
 import type { CapabilityRequest, PolicyDecision, Tier } from "./contracts.ts";
+import { log } from "../log.ts";
+import {
+  MAX_EVENTS_PER_KEY,
+  MemoryRateLimitStore,
+  RateLimitUnavailableError,
+  getDefaultRateLimitStore,
+  rateLimitKey,
+  withRateLimitStore,
+  type RateLimitStore,
+} from "./rate-limit-store.ts";
 
 export type Access = "read" | "write";
 
@@ -75,7 +95,7 @@ export interface PolicyRule {
 export interface EvaluateOptions {
   /** Clock in epoch ms (tests). Defaults to Date.now. */
   now?: () => number;
-  /** Rate limiter (tests). Defaults to the process-wide limiter. */
+  /** Rate limiter (tests). Defaults to the limiter over the default RateLimitStore. */
   limiter?: SlidingWindowRateLimiter;
 }
 
@@ -215,44 +235,67 @@ export function globMatch(glob: string, value: string): boolean {
 
 const HOUR_MS = 60 * 60 * 1000;
 
-/** In-process sliding window. Not shared across instances/processes. */
+/**
+ * Sliding window over a RateLimitStore (default: the shared SQL store). The
+ * limiter holds no state, so two instances over one store — two processes, or
+ * a process before and after a restart — see the same counts.
+ * Every method rejects with RateLimitUnavailableError when the store fails.
+ */
 export class SlidingWindowRateLimiter {
-  private readonly hits = new Map<string, number[]>();
   private readonly windowMs: number;
+  private readonly store: RateLimitStore | undefined;
 
-  constructor(windowMs: number = HOUR_MS) {
+  constructor(windowMs: number = HOUR_MS, store?: RateLimitStore) {
     this.windowMs = windowMs;
+    this.store = store;
+  }
+
+  private backing(): RateLimitStore {
+    return this.store ?? getDefaultRateLimitStore();
   }
 
   /** Remaining capacity check without recording. */
-  wouldExceed(key: string, max: number, now: number): boolean {
-    return this.prune(key, now).length >= max;
+  async wouldExceed(key: string, max: number, now: number): Promise<boolean> {
+    const { count } = await withRateLimitStore(this.backing(), "count", (s) => s.count(key, this.windowMs, now));
+    return count >= Math.min(max, MAX_EVENTS_PER_KEY);
   }
 
-  record(key: string, now: number): void {
-    const list = this.prune(key, now);
-    list.push(now);
-    this.hits.set(key, list);
+  /** Record unconditionally. */
+  async record(key: string, now: number): Promise<void> {
+    await withRateLimitStore(this.backing(), "hit", (s) => s.hit(key, this.windowMs, now));
   }
 
-  reset(): void {
-    this.hits.clear();
+  /**
+   * Atomically record one event only while fewer than `max` are inside the
+   * window. Returns whether it was recorded (false = the limit is reached).
+   */
+  async tryRecord(key: string, max: number, now: number): Promise<boolean> {
+    const hit = await withRateLimitStore(this.backing(), "hit", (s) => s.hit(key, this.windowMs, now, max));
+    return hit.recorded;
   }
 
-  private prune(key: string, now: number): number[] {
-    const cutoff = now - this.windowMs;
-    const list = (this.hits.get(key) ?? []).filter((t) => t > cutoff);
-    if (list.length) this.hits.set(key, list);
-    else this.hits.delete(key);
-    return list;
+  async reset(key: string): Promise<void> {
+    await withRateLimitStore(this.backing(), "reset", (s) => s.reset(key));
   }
 }
 
 const defaultLimiter = new SlidingWindowRateLimiter();
 
-/** Test hook: clear the process-wide limiter. */
+/** Store key for one (rule, client) window. Both parts are hashed (rate-limit-store.ts). */
+export function policyRateLimitKey(ruleId: string, clientId: string): string {
+  return rateLimitKey("policy", ruleId, clientId);
+}
+
+/**
+ * Test hook: empty the default store. Only works when a MemoryRateLimitStore is
+ * installed (setDefaultRateLimitStore) — it never wipes the shared SQL table.
+ */
 export function resetRateLimits(): void {
-  defaultLimiter.reset();
+  const store = getDefaultRateLimitStore();
+  if (!(store instanceof MemoryRateLimitStore)) {
+    throw new Error("resetRateLimits is a test hook: install a MemoryRateLimitStore first");
+  }
+  store.clear();
 }
 
 // ------------------------------------------------------------ policy file
@@ -382,11 +425,22 @@ function isValidRequest(req: CapabilityRequest): boolean {
   );
 }
 
-export function evaluatePolicy(
-  req: CapabilityRequest,
-  rules?: PolicyRule[],
-  opts: EvaluateOptions = {},
-): PolicyDecision {
+function applicableRules(req: CapabilityRequest, activeRules: PolicyRule[]): Array<{ rule: PolicyRule; id: string }> {
+  const clientId = req.client.client_id;
+  return activeRules
+    .map((rule, index) => ({ rule, id: rule.id ?? `rule[${index}]` }))
+    .filter(
+      ({ rule }) =>
+        (rule.client_id === "*" || rule.client_id === clientId) && globMatch(rule.capability, req.capability),
+    );
+}
+
+/**
+ * Steps 1-6 and 8 (synchronous, no I/O beyond the policy file). It does NOT
+ * apply max_per_hour: pass the result to `enforceRateLimits`, or call
+ * `evaluatePolicyWithRateLimits`.
+ */
+export function evaluatePolicy(req: CapabilityRequest, rules?: PolicyRule[]): PolicyDecision {
   if (!isValidRequest(req)) return deny(3, "invalid_request");
 
   const spec = lookupCapability(req.capability);
@@ -412,13 +466,7 @@ export function evaluatePolicy(
   }
   let tierRule: string | undefined;
 
-  const clientId = req.client.client_id;
-  const applicable = activeRules
-    .map((rule, index) => ({ rule, id: rule.id ?? `rule[${index}]` }))
-    .filter(
-      ({ rule }) =>
-        (rule.client_id === "*" || rule.client_id === clientId) && globMatch(rule.capability, req.capability),
-    );
+  const applicable = applicableRules(req, activeRules);
 
   // Tier overrides: raise-only.
   for (const { rule, id } of applicable) {
@@ -443,17 +491,84 @@ export function evaluatePolicy(
     }
   }
 
-  const limiter = opts.limiter ?? defaultLimiter;
-  const now = (opts.now ?? Date.now)();
-  const limited = applicable.filter(({ rule }) => rule.max_per_hour !== undefined);
-  for (const { rule, id } of limited) {
-    if (limiter.wouldExceed(`${id}\u0000${clientId}`, rule.max_per_hour as number, now)) {
-      return deny(tier, "rate_limited", id);
-    }
-  }
-  for (const { id } of limited) limiter.record(`${id}\u0000${clientId}`, now);
-
+  // Step 7 (max_per_hour) is enforceRateLimits — awaited, right after this call.
   const base = { tier, ...(tierRule ? { rule_id: tierRule } : {}) };
   if (tier === 2) return { decision: "escalate", reason: "approval_required", ...base };
   return { decision: "allow", reason: tier === 0 ? "tier0_read" : "tier1_in_scope", ...base };
+}
+
+/**
+ * Step 7: apply every applicable rule's max_per_hour to a decision that passed
+ * the other checks (a "deny" is returned untouched and consumes nothing).
+ *
+ *   - Over the limit            → deny "rate_limited" (rule_id = the rule).
+ *   - Store unreachable         → deny "rate_limit_unavailable" and log it, at
+ *     every tier including tier 0 (see docs/ops/rate-limits.md for why).
+ *   - No applicable max_per_hour → the store is never touched.
+ *
+ * All limits are checked first, then one slot per rule is taken atomically
+ * (`tryRecord`), so concurrent requests — from this or any other process —
+ * can never take more than `max_per_hour` slots of a rule. If a concurrent
+ * request takes the last slot between the check and the take, this request is
+ * denied; slots it already took for EARLIER rules in the list stay consumed
+ * (only possible with several limited rules, and only errs stricter).
+ */
+export async function enforceRateLimits(
+  req: CapabilityRequest,
+  decision: PolicyDecision,
+  rules?: PolicyRule[],
+  opts: EvaluateOptions = {},
+): Promise<PolicyDecision> {
+  if (decision.decision === "deny") return decision;
+  let activeRules: PolicyRule[];
+  if (rules) {
+    activeRules = rules;
+  } else {
+    try {
+      activeRules = loadPolicyRules();
+    } catch {
+      return deny(3, "policy_unavailable");
+    }
+  }
+  const limited = applicableRules(req, activeRules).filter(({ rule }) => rule.max_per_hour !== undefined);
+  if (limited.length === 0) return decision;
+
+  const limiter = opts.limiter ?? defaultLimiter;
+  const now = (opts.now ?? Date.now)();
+  const clientId = req.client.client_id;
+  const tier = decision.tier;
+  let current = limited[0].id;
+  try {
+    for (const { rule, id } of limited) {
+      current = id;
+      if (await limiter.wouldExceed(policyRateLimitKey(id, clientId), rule.max_per_hour as number, now)) {
+        return deny(tier, "rate_limited", id);
+      }
+    }
+    for (const { rule, id } of limited) {
+      current = id;
+      if (!(await limiter.tryRecord(policyRateLimitKey(id, clientId), rule.max_per_hour as number, now))) {
+        return deny(tier, "rate_limited", id);
+      }
+    }
+  } catch (err) {
+    if (!(err instanceof RateLimitUnavailableError)) throw err;
+    log.error("policy_rate_limit_unavailable", {
+      client_id: clientId.slice(0, 64),
+      capability: req.capability,
+      tier,
+      rule_id: current,
+    });
+    return deny(tier, "rate_limit_unavailable", current);
+  }
+  return decision;
+}
+
+/** evaluatePolicy followed by enforceRateLimits — the full decision. */
+export async function evaluatePolicyWithRateLimits(
+  req: CapabilityRequest,
+  rules?: PolicyRule[],
+  opts: EvaluateOptions = {},
+): Promise<PolicyDecision> {
+  return enforceRateLimits(req, evaluatePolicy(req, rules), rules, opts);
 }

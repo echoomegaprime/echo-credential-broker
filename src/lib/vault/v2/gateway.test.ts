@@ -41,6 +41,11 @@ import { CAPABILITY_REGISTRY, requiredScope } from "./policy-engine.ts";
 import { SUPPORTED_SCOPES } from "./oauth-server.ts";
 import { handleTelegramWebhook } from "./telegram.ts";
 import { resetWorkloadCacheForTests } from "./workload.ts";
+import { SlidingWindowRateLimiter } from "./policy-engine.ts";
+import { MemoryRateLimitStore, setDefaultRateLimitStore, type RateLimitStore } from "./rate-limit-store.ts";
+
+// Rate-limit state defaults to the shared SQL store; this file keeps it in memory.
+setDefaultRateLimitStore(new MemoryRateLimitStore());
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -685,6 +690,85 @@ describe("dispatchTool: tiers, scopes, approvals", () => {
     };
     assert.equal(init.result.protocolVersion, "2025-06-18");
     assert.equal(await handleMcpRequest({ jsonrpc: "2.0", method: "notifications/initialized" }, client("local:claude", [], "local"), w.deps), null);
+  });
+});
+
+describe("dispatchTool: max_per_hour over the shared rate-limit store", () => {
+  const reader = client("oc_limited", ["vault.read", "vault.write", "github.write"]);
+  const rules = [{ id: "cap", client_id: "oc_limited", capability: "*", max_per_hour: 2 }];
+
+  class DownStore implements RateLimitStore {
+    readonly kind = "sql" as const;
+    private fail(): never {
+      throw new Error("db down");
+    }
+    async hit(): Promise<never> {
+      return this.fail();
+    }
+    async count(): Promise<never> {
+      return this.fail();
+    }
+    async reset(): Promise<never> {
+      return this.fail();
+    }
+    async prune(): Promise<never> {
+      return this.fail();
+    }
+  }
+
+  it("the limit holds across two gateways sharing one store and across a restart", async () => {
+    const shared = new MemoryRateLimitStore();
+    const w = makeWorld();
+    const now = () => 1_000_000;
+    const instanceA: GatewayDeps = { ...w.deps, rules, policy: { limiter: new SlidingWindowRateLimiter(undefined, shared), now } };
+    const instanceB: GatewayDeps = { ...w.deps, rules, policy: { limiter: new SlidingWindowRateLimiter(undefined, shared), now } };
+    expectOk(await callWith(reader, "vault_list", {}, instanceA));
+    expectOk(await callWith(reader, "vault_status", {}, instanceB));
+    expectFail(await callWith(reader, "vault_list", {}, instanceA), "rate_limited");
+    expectFail(await callWith(reader, "vault_list", {}, instanceB), "rate_limited");
+    // A freshly constructed limiter (a restarted process) over the same store is still limited.
+    const restarted: GatewayDeps = { ...w.deps, rules, policy: { limiter: new SlidingWindowRateLimiter(undefined, shared), now } };
+    expectFail(await callWith(reader, "vault_status", {}, restarted), "rate_limited");
+    // Another client is unaffected, and the window still slides.
+    expectOk(await callWith(client("oc_other", ["vault.read"]), "vault_list", {}, restarted));
+    const later: GatewayDeps = { ...restarted, policy: { limiter: restarted.policy?.limiter, now: () => 1_000_000 + 3_600_000 } };
+    expectOk(await callWith(reader, "vault_list", {}, later));
+    const rows = await w.rows();
+    assert.deepEqual(
+      rows.filter((r) => r.client_id === "oc_limited").map((r) => [r.decision, r.result, r.error ?? null]),
+      [
+        ["allow", "ok", null],
+        ["allow", "ok", null],
+        ["deny", "denied", "rate_limited"],
+        ["deny", "denied", "rate_limited"],
+        ["deny", "denied", "rate_limited"],
+        ["allow", "ok", null],
+      ],
+    );
+    for (const key of shared.keys()) assert.match(key, /^policy:[0-9a-f]{64}$/);
+  });
+
+  it("store unreachable → rate_limit_unavailable for tier 0 and tier 1; nothing runs, the denial is ledgered", async () => {
+    const w = makeWorld();
+    const deps: GatewayDeps = { ...w.deps, rules, policy: { limiter: new SlidingWindowRateLimiter(undefined, new DownStore()) } };
+    const read = expectFail(await callWith(reader, "vault_list", {}, deps), "rate_limit_unavailable");
+    assert.equal(read.tier, 0);
+    const card = expectFail(
+      await callWith(reader, "entry_request_card", { site: "github.com", account: "bot", kind: "api_key", reason: "store is down" }, deps),
+      "rate_limit_unavailable",
+    );
+    assert.equal(card.tier, 1);
+    assert.equal(w.telegram.length, 0, "no card link may be sent when the request was denied");
+    const rows = await w.rows();
+    assert.deepEqual(
+      rows.map((r) => [r.capability, r.decision, r.tier, r.result, r.error]),
+      [
+        ["vault.list", "deny", 0, "denied", "rate_limit_unavailable"],
+        ["vault.card.request", "deny", 1, "denied", "rate_limit_unavailable"],
+      ],
+    );
+    // A client the rule does not cover never touches the store and is unaffected by the outage.
+    expectOk(await callWith(client("oc_other", ["vault.read"]), "vault_list", {}, deps));
   });
 });
 

@@ -24,6 +24,10 @@ import {
   type OwnerApprover,
 } from "./oauth-server.ts";
 import { authenticateRequest, listClients, revokeClient } from "./identity.ts";
+import { MemoryRateLimitStore, RATE_LIMIT_KEY_PATTERN, setDefaultRateLimitStore, type RateLimitStore } from "./rate-limit-store.ts";
+
+// Failed-attempt counts default to the shared SQL store; this file runs them in memory.
+setDefaultRateLimitStore(new MemoryRateLimitStore());
 
 // ---------------------------------------------------------------------------
 // Output capture: everything this file's code writes to stderr / console is
@@ -733,6 +737,156 @@ describe("token endpoint", () => {
     assert.ok(Number(blocked.headers.get("retry-after")) > 0);
     clock.advance(61_000);
     await tokenJson(await token({ grant_type: "refresh_token", refresh_token: tokens.refresh_token, client_id: clientId }));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Failed-attempt limits over the shared rate-limit store
+// ---------------------------------------------------------------------------
+
+describe("token endpoint: failed-attempt limits live in the shared store", () => {
+  const LIMIT = { maxFailures: 3, windowMs: 60_000 };
+  const BAD_REFRESH = `evr_${"A".repeat(43)}`;
+
+  /** A memory store whose operations can be switched off one by one. */
+  class FlakyStore implements RateLimitStore {
+    readonly kind = "sql" as const;
+    readonly inner = new MemoryRateLimitStore();
+    down = new Set<"hit" | "count" | "reset">();
+    private gate(op: "hit" | "count" | "reset"): void {
+      if (this.down.has(op)) throw new Error(`db down during ${op}`);
+    }
+    async hit(key: string, windowMs: number, now: number, limit?: number) {
+      this.gate("hit");
+      return this.inner.hit(key, windowMs, now, limit);
+    }
+    async count(key: string, windowMs: number, now: number) {
+      this.gate("count");
+      return this.inner.count(key, windowMs, now);
+    }
+    async reset(key: string) {
+      this.gate("reset");
+      return this.inner.reset(key);
+    }
+    async prune(now: number) {
+      return this.inner.prune(now);
+    }
+  }
+
+  function wire(store: OAuthStore, clock: FakeClock, rateLimitStore: RateLimitStore): Harness {
+    const approver = new FakeApprover();
+    resetOAuth();
+    configureOAuth({ store, clock, approver, env: { ECHO_VAULT_PUBLIC_URL: BASE }, rateLimit: LIMIT, rateLimitStore });
+    return { store, clock, approver };
+  }
+
+  const refresh = (clientId: string, refreshToken: string) =>
+    token({ grant_type: "refresh_token", refresh_token: refreshToken, client_id: clientId });
+
+  it("a restart (fresh OAuth context over the same store) keeps the client blocked with the same Retry-After", async () => {
+    const store = new MemoryOAuthStore();
+    const clock = new FakeClock();
+    const limits = new MemoryRateLimitStore();
+    const h = wire(store, clock, limits);
+    const { clientId, tokens } = await fullFlow(h);
+    for (let i = 0; i < 3; i++) assert.equal((await refresh(clientId, BAD_REFRESH)).status, 400);
+    clock.advance(10_000);
+    const blocked = await refresh(clientId, tokens.refresh_token);
+    assert.equal(blocked.status, 429);
+    assert.equal(blocked.headers.get("retry-after"), "50");
+
+    // "Restart": every piece of in-process state is dropped; only the stores remain.
+    wire(store, clock, limits);
+    const still = await refresh(clientId, tokens.refresh_token);
+    assert.equal(still.status, 429);
+    assert.equal(still.headers.get("retry-after"), "50");
+    assert.equal((await still.json()).error, "temporarily_unavailable");
+
+    // The block lifts when the oldest failure leaves the window, as before.
+    clock.advance(50_000);
+    await tokenJson(await refresh(clientId, tokens.refresh_token));
+  });
+
+  it("a successful grant clears the client's failures in the store", async () => {
+    const limits = new MemoryRateLimitStore();
+    const h = wire(new MemoryOAuthStore(), new FakeClock(), limits);
+    const { clientId, tokens } = await fullFlow(h);
+    assert.equal(limits.keys().length, 0);
+    for (let i = 0; i < 2; i++) assert.equal((await refresh(clientId, BAD_REFRESH)).status, 400);
+    assert.equal(limits.keys().length, 1);
+    await tokenJson(await refresh(clientId, tokens.refresh_token));
+    assert.equal(limits.keys().length, 0);
+  });
+
+  it("stored keys are hashes: no client_id, token, code or verifier ever becomes a key", async () => {
+    const limits = new MemoryRateLimitStore();
+    const h = wire(new MemoryOAuthStore(), new FakeClock(), limits);
+    const { clientId, tokens } = await fullFlow(h);
+    const { verifier } = pkce();
+    const bogusCode = `evc_${"B".repeat(43)}`;
+    rawSecrets.add(bogusCode);
+    await refresh(clientId, BAD_REFRESH);
+    await token({ grant_type: "authorization_code", code: bogusCode, code_verifier: verifier, client_id: clientId });
+    // A caller that puts a token where the client_id belongs.
+    await refresh(tokens.refresh_token, tokens.refresh_token);
+    await refresh(tokens.access_token, BAD_REFRESH);
+    const keys = limits.keys();
+    assert.equal(keys.length, 2); // the real client + one shared "malformed" bucket
+    for (const key of keys) {
+      assert.match(key, RATE_LIMIT_KEY_PATTERN);
+      assert.ok(key.startsWith("oauth.token:"));
+      for (const raw of [clientId, tokens.refresh_token, tokens.access_token, BAD_REFRESH, bogusCode, verifier, "malformed"]) {
+        assert.equal(key.includes(raw), false);
+      }
+    }
+  });
+
+  it("store unreachable → the token endpoint fails closed (503 rate_limit_unavailable) and nothing is consumed", async () => {
+    const limits = new FlakyStore();
+    const h = wire(new MemoryOAuthStore(), new FakeClock(), limits);
+    const { clientId, tokens } = await fullFlow(h);
+    limits.down.add("count");
+    const before = captured.length;
+    const res = await refresh(clientId, tokens.refresh_token);
+    assert.equal(res.status, 503);
+    assert.equal(res.headers.get("retry-after"), "5");
+    const body = await res.json();
+    assert.equal(body.error, "temporarily_unavailable");
+    assert.match(body.error_description, /^rate_limit_unavailable/);
+    assert.equal(body.access_token, undefined);
+    const logs = captured.slice(before).join("");
+    assert.match(logs, /oauth_rate_limit_unavailable/);
+    assert.match(logs, /rate_limit_store_error/);
+    assert.equal(logs.includes("db down"), false);
+    // The valid refresh token was not rotated by the refused request: it still works once the store is back.
+    limits.down.clear();
+    await tokenJson(await refresh(clientId, tokens.refresh_token));
+  });
+
+  it("a failed attempt is still refused when the failure cannot be recorded", async () => {
+    const limits = new FlakyStore();
+    const h = wire(new MemoryOAuthStore(), new FakeClock(), limits);
+    const { clientId } = await fullFlow(h);
+    limits.down.add("hit");
+    const before = captured.length;
+    const res = await refresh(clientId, BAD_REFRESH);
+    assert.equal(res.status, 400);
+    assert.equal((await res.json()).error, "invalid_grant");
+    assert.match(captured.slice(before).join(""), /oauth_rate_limit_unavailable/);
+  });
+
+  it("a completed grant is not lost when clearing the failures fails; the stale failures keep counting", async () => {
+    const limits = new FlakyStore();
+    const h = wire(new MemoryOAuthStore(), new FakeClock(), limits);
+    const { clientId, tokens } = await fullFlow(h);
+    for (let i = 0; i < 2; i++) await refresh(clientId, BAD_REFRESH);
+    limits.down.add("reset");
+    const rotated = await tokenJson(await refresh(clientId, tokens.refresh_token));
+    assert.match(rotated.refresh_token, /^evr_/);
+    assert.equal(limits.inner.keys().length, 1);
+    limits.down.clear();
+    await refresh(clientId, BAD_REFRESH); // third failure in the window
+    assert.equal((await refresh(clientId, rotated.refresh_token)).status, 429);
   });
 });
 
