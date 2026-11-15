@@ -3,7 +3,7 @@ import {
   PROVIDER_POLICIES,
   type ProviderPolicy,
 } from "./policy.ts";
-import { redactString, sanitizeError } from "./redaction.ts";
+import { redactString, redactValue, sanitizeError } from "./redaction.ts";
 import type { HttpMethod, ProviderId } from "./types.ts";
 
 export interface BrokerRequest {
@@ -80,12 +80,15 @@ export async function authorizedProviderFetch(
       });
     }
     const text = buf.toString("utf8");
-    const redactedText = redactString(text);
     let json: unknown = null;
     const contentType = res.headers.get("content-type") ?? "";
-    if (contentType.includes("json") || redactedText.startsWith("{") || redactedText.startsWith("[")) {
+    if (contentType.includes("json") || text.startsWith("{") || text.startsWith("[")) {
       try {
-        json = JSON.parse(redactedText);
+        // Parse first, then redact leaf by leaf. Redacting the serialized text
+        // first let a greedy rule (`Authorization: …` runs to the end of the
+        // line) eat the rest of the document, so a JSON body that merely
+        // contained such a string stopped being JSON.
+        json = redactValue(JSON.parse(text));
       } catch {
         json = null;
       }
@@ -94,7 +97,7 @@ export async function authorizedProviderFetch(
       status: res.status,
       ok: res.ok,
       json,
-      text: json == null ? redactedText.slice(0, 4096) : null,
+      text: json == null ? redactString(text).slice(0, 4096) : null,
     };
   } catch (error) {
     throw sanitizeError(error);
