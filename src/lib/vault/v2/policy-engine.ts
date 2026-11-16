@@ -36,6 +36,7 @@
  *     audit.read / verify   → audit.read       vault.list/metadata  → vault.read
  *     vault.entry.use.read  → vault.read       vault.entry.use.write → vault.write
  *     vault.card.request    → vault.write      <provider>.api.read  → <provider>.read
+ *     vault.entry.transfer  → vault.write
  *     deploy.production     → deploy.write     email.send           → email.write
  *   Grantable scopes are oauth-server.ts SUPPORTED_SCOPES; a capability whose
  *   scope is not in that list (deploy.*, email.*, payment.*) cannot be reached
@@ -161,6 +162,10 @@ export const CAPABILITY_REGISTRY: Readonly<Record<string, Readonly<CapabilitySpe
   // Hand a stored credential to the owner's own browser, sealed to an enrolled
   // injector (injector.ts). Tier 2 with no grant path: approved per request, every time.
   "vault.entry.inject": { tier: 2, access: "write" },
+  // Copy one entry's secret into a request to ANOTHER entry's site (gateway.ts
+  // entry_transfer). The receiving service may keep it. Tier 2 with no grant
+  // path: approved per request, every time.
+  "vault.entry.transfer": { tier: 2, access: "write" },
   "github.api.write": { tier: 2, access: "write" },
   "cloudflare.api.write": { tier: 2, access: "write" },
   "openai.api.write": { tier: 2, access: "write" },

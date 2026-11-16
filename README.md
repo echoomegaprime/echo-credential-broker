@@ -22,7 +22,7 @@ There is no self-asserted caller any more: `x-echo-agent` and similar headers ar
 | --- | --- | --- | --- |
 | 0 | Read | Runs if the client holds the scope | `vault_list`, `github_get_file`, `entry_list`, `audit_list`, GET via `provider_request` |
 | 1 | Reversible write, in scope | Runs if the client holds the scope | `github_create_branch`, file write on an `agent/*` branch, `github_create_draft_pr`, `entry_request_card` |
-| 2 | Hard to undo, or unknown | `approval_required` → owner approves that exact request on Telegram → call again with `approval_id` (single use, 10 minutes) | `github_repo_transfer`, file write on any other branch, any non-GET via `provider_request` / `credential_use` / `entry_use` |
+| 2 | Hard to undo, or unknown | `approval_required` → owner approves that exact request on Telegram → call again with `approval_id` (single use, 10 minutes) | `github_repo_transfer`, file write on any other branch, any non-GET via `provider_request` / `credential_use` / `entry_use`, every `entry_transfer` |
 | 3 | Human only | Always refused (admin tools: allowed only for the owner — the local stdio process or a passkey console session) | reveal / rotate / revoke a secret, Stripe writes, any `get_secret`-like tool name, the `admin_*` tools for any remote client |
 
 Scopes are `<namespace>.<read|write>`: `github.*`, `cloudflare.*`, `openai.*`, `xai.*`, `stripe.read`, `vault.read`, `vault.write`, `audit.read`. No scope implies another. The owner can tighten policy per client with `ECHO_VAULT_POLICY_FILE` (rules can only make things stricter).
@@ -39,6 +39,8 @@ A site can have several accounts (for example `github.com — echoomegaprime` an
    - `api_key` / `oauth_token` entries are sent as a bearer token; `password` entries as HTTP Basic with the account name. There is no form login or 2FA handling.
    - `cookie` entries hold one account's browser session (the owner pastes the cookies, or an extension submits them to the card link) and are sent as a `Cookie` header chosen per host and path; rotated session cookies are stored server-side and never returned. See [docs/ops/cookie-entries.md](docs/ops/cookie-entries.md).
    - A **401** from the site flags that one entry for re-entry (`site_rejected_credential`); request a new card with its `entry_id`. A **403** returns `site_forbidden` and leaves the entry active (it is a scope/rate problem, not a bad credential).
+
+`entry_transfer` hands a stored credential to another service you also have an entry for, without the agent seeing either one: the destination entry authenticates one POST/PUT/PATCH to its own site, and the source entry's secret replaces the `{{vault:source}}` placeholder in one field of the JSON body. Every call needs your approval (the prompt says TRANSFER and names both entries, the URL and the field), and the destination service keeps a copy afterwards. See [docs/ops/entry-transfer.md](docs/ops/entry-transfer.md).
 
 `entry_inject` with `{site, account?, target_origin, mode, injector_id?, task}` asks for a credential to be placed into the **owner's own browser** by an enrolled injector (the owner's browser extension): `mode: "cookies"` sets a cookie entry's session cookies for `target_origin`, `mode: "field"` types a password entry's password into a login field. `target_origin` must be `https://<host>` on the entry's own site or a subdomain. Tier 2 with no standing grant: **every** call needs a Telegram approval, and the approved retry returns a single-use ticket (120 s) and metadata — never the credential. The injector redeems the ticket at `POST /api/injector/redeem` and receives the credential sealed to its P-256 public key (ECDH-ES + HKDF-SHA256 + AES-256-GCM); the agent, the ledger and the database only ever hold hashes. Owner steps and threat model: [docs/ops/injector-channel.md](./docs/ops/injector-channel.md); wire contract: [docs/ops/injector-contract.md](./docs/ops/injector-contract.md).
 
@@ -58,6 +60,7 @@ The owner has admin tools: `admin_list_clients`, `admin_set_client_scopes`, `adm
 | Daily audit digest | [docs/ops/daily-digest.md](./docs/ops/daily-digest.md) | `npm run vault:digest` |
 | Shared, durable rate limits | [docs/ops/rate-limits.md](./docs/ops/rate-limits.md) | — |
 | DNS pinning for `entry_use` | [docs/ops/dns-pinning.md](./docs/ops/dns-pinning.md) | — |
+| `entry_transfer`: hand a credential to another service | [docs/ops/entry-transfer.md](./docs/ops/entry-transfer.md) | — |
 | Tool test coverage and opt-in live tests | [docs/ops/test-coverage.md](./docs/ops/test-coverage.md) | — |
 
 Pass runner arguments after `--`, for example `npm run vault:digest -- --from 2026-11-13`.
