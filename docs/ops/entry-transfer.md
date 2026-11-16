@@ -112,7 +112,7 @@ secret, and may keep it. From then on that copy is outside the vault:
 | `entry_kind_not_transferable` / `entry_kind_not_usable` | The source / destination entry is of a kind that cannot be used here. |
 | `hostname_not_allowed` | `host` is not the destination site or `api.<site>`, or is not reachable through the broker. |
 | `missing_scope` | The client lacks `vault.write`. Neither entry is looked up. |
-| `entry_use_failed`, `entry_needs_reentry`, … | An entry could not be used or the request failed. `failed_entry` says which side; `request_sent` says whether the request left the broker. |
+| `entry_use_failed`, `entry_needs_reentry`, … | An entry could not be used or the request failed. `failed_entry` says which side; `request_sent` is `true` (a response was read), `false` (nothing left the broker) or `"unknown"` (the connection was opened but no response was read: a timeout, a disconnect or an oversized answer). Treat `"unknown"` as "the destination may hold the secret": check there before retrying. |
 
 ## Limits
 

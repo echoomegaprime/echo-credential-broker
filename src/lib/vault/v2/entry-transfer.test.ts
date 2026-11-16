@@ -919,6 +919,20 @@ describe("entry_transfer: the destination's answer and failures", () => {
     assert.equal((await w.entryOf(DST_SITE, "workspace")).last_used_at, null);
   });
 
+  it("a request that left the broker but got no readable answer reports request_sent unknown, never false", async () => {
+    const w = await pairWorld();
+    // The destination received the request, then the connection dropped before any response was read.
+    w.site.respond = () => {
+      throw new Error("socket hang up");
+    };
+    const dropped = expectFail(await approveAndRun(w, AGENT, transferArgs({ task: "dropped answer" })), "entry_use_failed");
+    assert.equal(w.site.calls.length, 1, "the destination did receive the request");
+    assert.deepEqual([dropped.request_sent, dropped.failed_entry], ["unknown", "destination"]);
+    scan("dropped-answer result", dropped);
+    const rows = await w.transferRows();
+    assert.equal(rows.some((r) => r.result === "ok"), false, "no ok row for either entry");
+  });
+
   it("a transfer that ran but could not be recorded is not reported as a success, and says the request was sent", async () => {
     const w = await pairWorld();
     // The destination's outcome row cannot be written.

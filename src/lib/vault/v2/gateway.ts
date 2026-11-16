@@ -1064,6 +1064,11 @@ interface SiteRequest {
    */
   authHeader?: string;
   /**
+   * Called once the request is about to leave the broker (the pinned connection is open, or the
+   * test fetch is about to be called). After this, a failure cannot prove the site did not get it.
+   */
+  onConnect?: () => void;
+  /**
    * `cookie` entries: called (server-side only) when the response's Set-Cookie headers changed
    * the jar, with the new canonical jar JSON — a secret — and its metadata. Must not throw.
    */
@@ -1161,6 +1166,7 @@ async function siteRequest(
   }
   let res: Response;
   if (deps.fetch) {
+    req.onConnect?.();
     res = await deps.fetch(url, init); // tests only
   } else {
     res = await (deps.pinnedFetch ?? pinnedFetch)(
@@ -1170,7 +1176,10 @@ async function siteRequest(
         addresses: pinnedAddresses,
         timeoutMs: ENTRY_USE_LIMITS.timeoutMs,
         maxResponseBytes: ENTRY_USE_LIMITS.maxResponseBytes,
-        onConnect: (address) => log.info("vault_entry_use_connected", { entry_id: entry.id, host: url.hostname, address }),
+        onConnect: (address) => {
+          req.onConnect?.();
+          log.info("vault_entry_use_connected", { entry_id: entry.id, host: url.hostname, address });
+        },
       },
     );
   }
@@ -1712,6 +1721,8 @@ async function entryTransferPlan(a: Record<string, unknown>, env: Env): Promise<
     run: async (ctx) => {
       const ledger = env.deps.ledger ?? appendLedger;
       let seen: { status: number } | null = null;
+      /** The request reached the point of leaving the broker; without a response read back, delivery is unknown. */
+      let connected = false;
       let ledgered = false;
       let preflight: string | null = null;
       /** Why the destination side failed (its entry could not be used, the request failed, or its row could not be written). */
@@ -1778,7 +1789,7 @@ async function entryTransferPlan(a: Record<string, unknown>, env: Env): Promise<
                     response = await siteRequest(
                       destinationSecret,
                       meta,
-                      { host, method, path, bodyText, contentType: "application/json", authHeader },
+                      { host, method, path, bodyText, contentType: "application/json", authHeader, onConnect: () => void (connected = true) },
                       env.deps,
                     );
                   } catch (err) {
@@ -1842,7 +1853,9 @@ async function entryTransferPlan(a: Record<string, unknown>, env: Env): Promise<
         return { ledgered, audit, result: { ok: true, data: { from: agentEntryView(used.entry), to: agentEntryView(destination), ...response } } };
       } catch (err) {
         // Whether the request left the broker matters to the caller: if it did, the destination may hold the secret.
-        const requestSent = seen !== null;
+        // true: a response was read. "unknown": the connection was opened but no response was read
+        // (timeout, disconnect, oversized answer), so the destination may or may not hold the secret.
+        const requestSent: boolean | "unknown" = seen !== null ? true : connected ? "unknown" : false;
         if (preflight) {
           return {
             ledgered,
