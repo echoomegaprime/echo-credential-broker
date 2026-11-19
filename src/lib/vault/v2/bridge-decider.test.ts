@@ -1,7 +1,8 @@
 // library-first: echo.functions.search → no existing impl found (2026-11-15)
 /**
- * The second decider: Lyra's consent bridge decides connection and first-use
- * approvals over a loopback-only, service-token endpoint, and every decision
+ * The second decider: Lyra's consent bridge decides approvals of every
+ * capability class (widened 2026-11-19 on the Commander's ruling) over a
+ * loopback-only, service-token endpoint, and every decision
  * is recorded under client_id "service:lyra-consent-bridge" — never as the
  * owner. The owner's Telegram path (MAC + approver id → "owner:telegram")
  * must be completely unaffected.
@@ -48,7 +49,7 @@ const FIRST_USE_REQ: CapabilityRequest = {
   params: { method: "GET", host: "example.com", path: "/" },
 };
 
-/** A tier-2 escalation approval: decidable ONLY by the owner. */
+/** A tier-2 escalation approval: owner-only until the 2026-11-19 widening. */
 const ESCALATION_REQ: CapabilityRequest = {
   client: { client_id: "oc_claude", name: "Claude", kind: "oauth", scopes: ["github.write"] },
   capability: "github.pr.merge",
@@ -199,7 +200,7 @@ describe("bridge decider (service path)", () => {
     assert.equal(rows.length, 0);
   });
 
-  it("out-of-scope approval type → 403, still pending, and the owner can still decide it", async () => {
+  it("any approval type → the bridge may decide it (2026-11-19 autoapprove-everything ruling)", async () => {
     const { rows, opts } = harness();
     const rec = await createApproval(ESCALATION_REQ, "merge PR 12", opts);
 
@@ -207,23 +208,15 @@ describe("bridge decider (service path)", () => {
       decideRequest({ approval_id: rec.id, action: "approve" }),
       opts,
     );
-    assert.equal(res.status, 403);
-    assert.equal(((await res.json()) as Record<string, unknown>).error, "out_of_scope");
-    assert.equal((await getApproval(rec.id, opts))?.status, "pending");
-    assert.equal(rows.length, 0, "a refused bridge attempt writes no decision row");
-
-    // The refusal did not burn the approval: the owner's Telegram tap still works.
-    const d = await decideApproval(
-      rec.id,
-      "approve",
-      APPROVER,
-      ownerMac("approve", rec.id, rec.request_digest),
-      opts,
-    );
-    assert.equal(d.ok, true);
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as Record<string, unknown>;
+    assert.equal(body.decided_by, BRIDGE_DECIDER_CLIENT_ID);
+    assert.equal(body.status, "approved");
+    const after = await getApproval(rec.id, opts);
+    assert.equal(after?.status, "approved");
+    assert.equal(after?.decided_by, BRIDGE_DECIDER_CLIENT_ID);
     assert.equal(rows.length, 1);
-    assert.equal(rows[0].client_id, "owner:telegram");
-    assert.equal((await getApproval(rec.id, opts))?.decided_by, APPROVER);
+    assert.equal(rows[0].client_id, BRIDGE_DECIDER_CLIENT_ID);
   });
 
   it("the owner Telegram path is unaffected: MAC + approver id still decide, as owner:telegram", async () => {

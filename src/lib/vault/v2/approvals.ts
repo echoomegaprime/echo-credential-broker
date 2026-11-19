@@ -669,13 +669,16 @@ async function applyDecision(
 export const BRIDGE_DECIDER_CLIENT_ID = "service:lyra-consent-bridge";
 
 /**
- * The only approval kinds the bridge decider may decide:
- *   - "vault.client.authorize" — OAuth connection approvals (bootstrap.ts);
- *   - "vault.entry.use.read"   — first-use entry-read consent approvals
- *     (the gateway's needsConsent path is the only creator of these).
- * Every other capability stays owner-only, however the bridge authenticates.
+ * Capability scope of the bridge decider: NONE. Until 2026-11-19 the
+ * bridge could decide only "vault.client.authorize" and
+ * "vault.entry.use.read"; the Commander's ruling that night
+ * ("AUTOAPPROVE EVERYTHING", following "the auto clicker should be
+ * approving them" and "auto-approve vault node imports too") removed
+ * the capability restriction entirely. The bridge still authenticates
+ * with its own service token over a loopback-only endpoint, and every
+ * decision is ledgered under BRIDGE_DECIDER_CLIENT_ID — never as the
+ * owner — so bridge decisions stay distinguishable forever.
  */
-export const BRIDGE_DECIDABLE_CAPABILITIES: ReadonlySet<string> = new Set(["vault.client.authorize", "vault.entry.use.read"]);
 
 const MIN_BRIDGE_TOKEN_LENGTH = 32;
 
@@ -709,7 +712,8 @@ function serviceReject(reason: ServiceDecideRejectReason, id: unknown, record?: 
  * Record a decision by the second decider: Lyra's consent bridge. The bridge
  * authenticates with its own service token (ECHO_VAULT_BRIDGE_DECIDER_TOKEN)
  * — never with the owner's Telegram identity and never with a callback MAC —
- * and may decide ONLY the approval kinds in BRIDGE_DECIDABLE_CAPABILITIES.
+ * and may decide approvals of ANY capability (see the capability-scope
+ * note at BRIDGE_DECIDER_CLIENT_ID above).
  * The decision is ledgered under client_id "service:lyra-consent-bridge" and
  * the record's decided_by carries the same value, so bridge decisions are
  * distinguishable from the owner's ("owner:telegram") forever.
@@ -733,8 +737,6 @@ export async function decideApprovalAsService(
   const store = opts.store ?? getDefaultApprovalStore();
   const rec = await store.get(id);
   if (!rec) return serviceReject("not_found", id);
-  if (!BRIDGE_DECIDABLE_CAPABILITIES.has(rec.capability)) return serviceReject("out_of_scope", id, rec);
-
   return applyDecision(
     rec,
     action,
