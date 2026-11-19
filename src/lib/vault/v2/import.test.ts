@@ -190,6 +190,59 @@ describe("vault import: applying", () => {
     assert.equal((await w.entries.list({})).length, 1);
   });
 
+  it("a fingerprint collision is not treated as the same secret", async () => {
+    // Force every entry of the site to share the short fingerprint, as a 32-bit collision would.
+    class CollidingStore extends MemoryEntryStore {
+      override async insert(row: Parameters<MemoryEntryStore["insert"]>[0]) {
+        return super.insert({ ...row, fingerprint: "00000000" });
+      }
+      override async list(filter: Parameters<MemoryEntryStore["list"]>[0]) {
+        return (await super.list(filter)).map((e) => ({ ...e, fingerprint: secretFingerprint(SECRETS.github2) }));
+      }
+    }
+    const w = world(new FakeVaultBackend(), new CollidingStore());
+    const first = { "/a/.env": `GITHUB_TOKEN=${SECRETS.github}` };
+    await applyImport(planImport(manifestOf(first)), { ...w.deps, resolveSecret: resolverOf(first) });
+    const second = { "/b/.env": `SECOND_TOKEN=${SECRETS.github2}` };
+    const res = await applyImport(planImport(manifestOf(second)), { ...w.deps, resolveSecret: resolverOf(second) });
+    assert.equal(res.counts.already_stored, 0, "a different secret with a matching fingerprint must still be imported");
+    assert.equal(res.counts.imported, 1);
+    assert.equal((await w.entries.list({})).length, 2);
+  });
+
+  it("an entry-store outage costs one entry, not the batch", async () => {
+    class FlakyStore extends MemoryEntryStore {
+      calls = 0;
+      override async findIdentity(...args: Parameters<MemoryEntryStore["findIdentity"]>) {
+        this.calls++;
+        if (this.calls === 2) throw new Error("db blip");
+        return super.findIdentity(...args);
+      }
+    }
+    const w = world(new FakeVaultBackend(), new FlakyStore());
+    const res = await applyImport(planImport(manifestOf()), { ...w.deps, resolveSecret: resolverOf() });
+    assert.equal(res.counts.store_unavailable, 1);
+    assert.equal(res.counts.imported, 2);
+    assert.equal(res.outcomes.length, 3);
+    noSecrets(res);
+  });
+
+  it("an outage while checking for duplicates also costs only that entry", async () => {
+    class FlakyList extends MemoryEntryStore {
+      calls = 0;
+      override async list(filter: Parameters<MemoryEntryStore["list"]>[0]) {
+        this.calls++;
+        if (this.calls === 1) throw new Error("db blip");
+        return super.list(filter);
+      }
+    }
+    const store = new FlakyList();
+    const w = world(new FakeVaultBackend(), store);
+    const res = await applyImport(planImport(manifestOf()), { ...w.deps, resolveSecret: resolverOf() });
+    assert.equal(res.counts.store_unavailable, 1);
+    assert.equal(res.counts.imported, 2);
+  });
+
   it("reports a source that changed since the scan and keeps going", async () => {
     const w = world();
     const changed = { ...FILES, "/srv/app/.env": "YOUTUBE_API_KEY=rotated-elsewhere\nGITHUB_TOKEN=gone\nPORT=8080", "/srv/other/.env": "GH=gone" };

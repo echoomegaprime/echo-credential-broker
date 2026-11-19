@@ -68,10 +68,11 @@ the reason. It holds no secret value.
 | `imported` | Stored. The entry is active. |
 | `would_import` | Preview only: this would be stored. |
 | `exists` | An entry with this site, account and kind is already there. |
-| `already_stored` | Another entry of the same site and kind already holds this exact secret. |
+| `already_stored` | Another entry of the same site and kind already holds this exact secret (compared against the stored secret, not just its short fingerprint). |
 | `source_unreadable` | The file or line no longer holds the secret the scan recorded. Scan again. |
 | `secret_out_of_range` | Shorter than 8 or longer than 4096 characters. |
 | `vault_unavailable` | The vault backend could not be reached. Nothing was stored for this entry. |
+| `store_unavailable` | The entry database could not be read for this entry. Nothing was stored for it; run again. |
 | `store_failed` | The entry row could not be written; the secret was taken back out of the backend. |
 
 | Skipped finding | Why |

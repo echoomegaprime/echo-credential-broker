@@ -23,9 +23,10 @@
  * cards, rotation and delete all work on them. Using one still needs the
  * owner's consent exactly as for a card-entered entry.
  */
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { log } from "../log.ts";
 import { registerSecretForRedaction } from "../redaction.ts";
+import { constantTimeEqual } from "./approvals.ts";
 import {
   EntryError,
   entryLabel,
@@ -282,6 +283,7 @@ export type ImportStatus =
   | "secret_out_of_range"
   | "secret_in_metadata"
   | "vault_unavailable"
+  | "store_unavailable"
   | "store_failed";
 
 export interface ImportOutcome {
@@ -324,8 +326,13 @@ const STATUSES: readonly ImportStatus[] = [
   "secret_out_of_range",
   "secret_in_metadata",
   "vault_unavailable",
+  "store_unavailable",
   "store_failed",
 ];
+
+function sha256Hex(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
 
 /**
  * Plan → entries. Safe to run twice: an identity that already exists is
@@ -352,7 +359,14 @@ export async function applyImport(plan: ImportPlan, deps: ImportDeps): Promise<I
   };
 
   for (const p of plan.entries) {
-    const identity = await v.entries.findIdentity(p.site, p.account, p.kind);
+    let identity: EntryMetadata | null;
+    try {
+      identity = await v.entries.findIdentity(p.site, p.account, p.kind);
+    } catch {
+      // A store outage costs this entry, not the batch.
+      done(p, "store_unavailable");
+      continue;
+    }
     if (identity) {
       done(p, "exists", identity.id);
       continue;
@@ -377,8 +391,31 @@ export async function applyImport(plan: ImportPlan, deps: ImportDeps): Promise<I
       continue;
     }
     const fp = secretFingerprint(secret);
-    const twin = (await v.entries.list({ site: p.site })).find((e) => e.kind === p.kind && e.fingerprint === fp);
+    // The stored fingerprint is 32 bits: it nominates candidates, it does not prove
+    // equality. Compare against the stored secret itself before calling it a duplicate.
+    let candidates: EntryMetadata[];
+    try {
+      candidates = (await v.entries.list({ site: p.site })).filter((e) => e.kind === p.kind && e.fingerprint === fp);
+    } catch {
+      secret = null;
+      done(p, "store_unavailable");
+      continue;
+    }
+    let twin: EntryMetadata | null = null;
+    for (const candidate of candidates) {
+      let held: string;
+      try {
+        held = await v.readSecret(candidate);
+      } catch {
+        continue; // cannot prove it is the same secret: import rather than drop a credential
+      }
+      if (constantTimeEqual(sha256Hex(held), sha256Hex(secret))) {
+        twin = candidate;
+        break;
+      }
+    }
     if (twin) {
+      secret = null;
       done(p, "already_stored", twin.id);
       continue;
     }

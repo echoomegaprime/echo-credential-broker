@@ -149,7 +149,12 @@ try {
       skipped_by_reason: skippedByReason,
     })}\n`,
   );
-  const failed = result.counts.source_unreadable + result.counts.vault_unavailable + result.counts.store_failed + result.counts.secret_in_metadata;
+  const failed =
+    result.counts.source_unreadable +
+    result.counts.vault_unavailable +
+    result.counts.store_unavailable +
+    result.counts.store_failed +
+    result.counts.secret_in_metadata;
   exitCode = failed > 0 ? 1 : 0;
 } catch (err) {
   // Never the underlying message (it could quote a file): only a code.
