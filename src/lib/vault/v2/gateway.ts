@@ -49,6 +49,14 @@
  *   flags that one entry for re-entry; a 403 (forbidden) returns site_forbidden
  *   and leaves the entry active.
  *
+ *   Entry transfer (`entry_transfer`, entry-transfer.ts): one POST/PUT/PATCH
+ *   to the DESTINATION entry's own site, authenticated with that entry, whose
+ *   JSON body carries the SOURCE entry's secret in the one field the agent
+ *   marked with a placeholder. `vault.entry.transfer` (tier 2): approved per
+ *   request, every time, no grant. The approval binds both entries, the
+ *   request, the body (with the placeholder) and the field. Neither secret is
+ *   returned; a 401 flags the destination entry only.
+ *
  *   Contents write (`github_create_or_update_file`): policy-engine.ts makes
  *   `agent/*` branches tier 1 and every other branch tier 2. The handler
  *   (github-capabilities.ts, classifyContentsWrite) refuses the repository's
@@ -93,6 +101,7 @@ import {
   CardError,
   ENTRY_KINDS,
   EntryError,
+  MIN_SECRET_LENGTH,
   flagForReentry,
   getCardStatus,
   listEntries,
@@ -110,6 +119,19 @@ import {
 import type { CapabilityRequest, ClientIdentity, LedgerEntryInput, PolicyDecision } from "./contracts.ts";
 import { buildDigest, DigestError, formatDigest, resolveDigestWindow, sendDigest, type DigestDeps } from "./digest.ts";
 import { getDefaultEntryGrantStore, listEntryGrants, revokeEntryGrant, type EntryGrantStore } from "./entry-grants.ts";
+import {
+  buildTransferBody,
+  locatePlaceholder,
+  parseTransferAuth,
+  TRANSFER_CAPABILITY,
+  TRANSFER_DESTINATION_KINDS,
+  TRANSFER_METHODS,
+  TRANSFER_PLACEHOLDER,
+  TRANSFER_SOURCE_KINDS,
+  TransferInputError,
+  transferRedactionForms,
+  type TransferAuth,
+} from "./entry-transfer.ts";
 import { listClients, revokeClient, setClientScopes } from "./identity.ts";
 import { isMintedOwnerIdentity, mintBootstrapCode, OWNER_CLIENT_ID_PATTERN, type BootstrapDeps } from "./owner-identity.ts";
 import type { GithubAppDeps } from "./github-app.ts";
@@ -481,6 +503,38 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = Object.freeze([
     ),
   },
   {
+    name: "entry_transfer",
+    description:
+      `Hand a stored credential to another service the owner also has an entry for, without seeing it: one HTTPS request (POST, PUT or PATCH) to the DESTINATION entry's own site (host = that site or api.<site>), authenticated with the destination entry exactly as entry_use would, or with its secret in the request header named by to_auth. The body is a JSON object in which exactly one string field has the value ${TRANSFER_PLACEHOLDER}; the broker replaces that value with the SOURCE entry's secret server-side. Source entries: api_key or oauth_token. Destination entries: api_key, oauth_token or password. Neither secret is ever returned: the result is the status and a redacted body, and no response headers. Needs scope vault.write and the owner's Telegram approval on EVERY call (there is no standing grant): the first call returns \`approval_required\`; call again with the same arguments plus approval_id. The destination service receives the source secret and may store it. A 401 from the destination flags the destination entry for re-entry (site_rejected_credential); a 403 returns site_forbidden and leaves both entries active.`,
+    inputSchema: schema(
+      {
+        from_site: { type: "string", description: "Domain of the SOURCE entry: the credential being handed over, e.g. x.ai." },
+        from_account: { type: "string", description: "Which account on the source site. Default: the site's default entry." },
+        from_kind: { type: "string", enum: ENTRY_KINDS, description: "Only needed when the source account has entries of several kinds. Must be api_key or oauth_token." },
+        to_site: { type: "string", description: "Domain of the DESTINATION entry: the service that receives the credential and whose entry authenticates the request." },
+        to_account: { type: "string", description: "Which account on the destination site. Default: the site's default entry." },
+        to_kind: { type: "string", enum: ENTRY_KINDS, description: "Only needed when the destination account has entries of several kinds. Must be api_key, oauth_token or password." },
+        method: { type: "string", enum: TRANSFER_METHODS },
+        host: { type: "string", description: "Exactly the destination site or api.<site>. Default: the destination site." },
+        url_path: { type: "string", description: "Path and query on the destination, starting with /." },
+        body: {
+          type: "object",
+          description: `JSON object sent to the destination. Exactly one string field, at any depth, must have the value ${TRANSFER_PLACEHOLDER} (the whole value, not part of a longer string, not a key).`,
+        },
+        to_auth: {
+          type: "object",
+          description:
+            'How the destination secret authenticates. Omit for the entry_use default. { "scheme": "header", "name": "<header-name>" } sends it as that request header instead of the Authorization header (api_key / oauth_token destinations only).',
+          properties: { scheme: { type: "string", enum: ["default", "header"] }, name: { type: "string" } },
+          required: ["scheme"],
+          additionalProperties: false,
+        },
+        task: { type: "string", description: "What you are doing and why. Required; shown to the owner and recorded in the audit ledger.", maxLength: 300 },
+      },
+      ["from_site", "to_site", "method", "url_path", "body", "task"],
+    ),
+  },
+  {
     name: "entry_inject",
     description:
       "Ask for a stored credential to be placed into the OWNER'S OWN BROWSER by an enrolled injector (the owner's browser extension) — you never see it. mode \"cookies\" sets the session cookies of a cookie entry for target_origin; mode \"field\" types the password of a password entry into the field the owner's page shows. target_origin must be https://<host> where host is the entry's site or a subdomain of it. Tier 2, scope vault.write: EVERY call needs the owner's Telegram approval of that exact request (there is no standing grant). The first call returns `approval_required`; call again with the same arguments plus approval_id to get a single-use ticket (120 s) that only the bound injector can redeem. The result is the ticket and metadata, never a secret.",
@@ -794,6 +848,7 @@ function checkArgs(def: ToolDefinition, a: Record<string, unknown>): void {
       (type === "integer" && typeof value === "number" && Number.isInteger(value)) ||
       (type === "number" && typeof value === "number" && Number.isFinite(value)) ||
       (type === "boolean" && typeof value === "boolean") ||
+      (type === "object" && isRecord(value)) ||
       (type === "array" && Array.isArray(value));
     if (!ok) throw new ToolInputError("invalid_arguments", `${key}: expected ${type}`);
     if (spec.enum && !spec.enum.includes(typeof value === "string" && key === "method" ? value.toUpperCase() : value)) {
@@ -1004,6 +1059,16 @@ interface SiteRequest {
   bodyText?: string;
   contentType?: string;
   /**
+   * entry_transfer `to_auth` only (api_key / oauth_token entries): send the secret as this
+   * lower-case request header INSTEAD of the Authorization header. Absent → the default per kind.
+   */
+  authHeader?: string;
+  /**
+   * Called once the request is about to leave the broker (the pinned connection is open, or the
+   * test fetch is about to be called). After this, a failure cannot prove the site did not get it.
+   */
+  onConnect?: () => void;
+  /**
    * `cookie` entries: called (server-side only) when the response's Set-Cookie headers changed
    * the jar, with the new canonical jar JSON — a secret — and its metadata. Must not throw.
    */
@@ -1079,6 +1144,8 @@ async function siteRequest(
     const basic = Buffer.from(`${entry.account}:${secret}`, "utf8").toString("base64");
     registerSecretForRedaction(basic); // a site that echoes headers must not hand the pair back
     headers.set("authorization", `Basic ${basic}`);
+  } else if (req.authHeader) {
+    headers.set(req.authHeader, secret); // and no Authorization header
   } else {
     headers.set("authorization", `Bearer ${secret}`);
   }
@@ -1099,6 +1166,7 @@ async function siteRequest(
   }
   let res: Response;
   if (deps.fetch) {
+    req.onConnect?.();
     res = await deps.fetch(url, init); // tests only
   } else {
     res = await (deps.pinnedFetch ?? pinnedFetch)(
@@ -1108,7 +1176,10 @@ async function siteRequest(
         addresses: pinnedAddresses,
         timeoutMs: ENTRY_USE_LIMITS.timeoutMs,
         maxResponseBytes: ENTRY_USE_LIMITS.maxResponseBytes,
-        onConnect: (address) => log.info("vault_entry_use_connected", { entry_id: entry.id, host: url.hostname, address }),
+        onConnect: (address) => {
+          req.onConnect?.();
+          log.info("vault_entry_use_connected", { entry_id: entry.id, host: url.hostname, address });
+        },
       },
     );
   }
@@ -1497,6 +1568,308 @@ async function entryUsePlan(a: Record<string, unknown>, env: Env): Promise<Plan>
           return { ledgered, audit, result: { ok: false, error: preflight, detail, entry_id: entry.id } };
         }
         return { ledgered, audit, result: entryFailure(err) };
+      }
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// entry_transfer: hand one entry's secret to another entry's site (entry-transfer.ts)
+// ---------------------------------------------------------------------------
+
+const TRANSFER_PREFLIGHT_DETAIL: Readonly<Record<string, string>> = {
+  request_too_large: "The body with the credential in place exceeds the broker request limit. Nothing was sent.",
+  entry_secret_unprotectable: "A stored secret is too short to be redacted reliably, so it is not transferred. Nothing was sent.",
+};
+
+/**
+ * `entry_transfer`: tier 2 (`vault.entry.transfer`), so EVERY call is escalated
+ * and approved by the owner; there is no consent grant. Both secrets exist only
+ * inside the two nested cards.useEntry callbacks below: the source entry is
+ * opened first, the destination entry inside it, and the request is made
+ * inside the destination's callback. Each entry therefore gets its own ledger
+ * row and last-used update, and the source's row is written last, with the
+ * real outcome (never "ok" when the destination could not be used).
+ */
+async function entryTransferPlan(a: Record<string, unknown>, env: Env): Promise<Plan> {
+  const capability = TRANSFER_CAPABILITY;
+  const method = reqStr(a, "method").toUpperCase();
+  if (!(TRANSFER_METHODS as readonly string[]).includes(method)) {
+    throw new ToolInputError("invalid_arguments", `method: must be one of ${TRANSFER_METHODS.join(", ")}`);
+  }
+  const task = sanitizeDisplayText(reqStr(a, "task"), 300);
+  if (!task) throw new ToolInputError("invalid_task", "task: describe what you are doing and why");
+  let path: string;
+  try {
+    path = normalizeResourcePath(reqStr(a, "url_path"));
+  } catch {
+    throw new ToolInputError("invalid_arguments", "url_path must be a relative path starting with /");
+  }
+  for (const key of ["from_kind", "to_kind"] as const) {
+    if (a[key] !== undefined && !ENTRY_KINDS.includes(a[key] as EntryKind)) {
+      throw new ToolInputError("invalid_arguments", `${key}: must be one of ${ENTRY_KINDS.join(", ")}`);
+    }
+  }
+  const sourceKindError = () =>
+    new ToolInputError("entry_kind_not_transferable", `only ${TRANSFER_SOURCE_KINDS.join(" and ")} entries can be transferred`);
+  const destinationKindError = () =>
+    new ToolInputError("entry_kind_not_usable", `the destination entry must be one of ${TRANSFER_DESTINATION_KINDS.join(", ")}`);
+  if (a.from_kind !== undefined && !TRANSFER_SOURCE_KINDS.includes(a.from_kind as EntryKind)) throw sourceKindError();
+  if (a.to_kind !== undefined && !TRANSFER_DESTINATION_KINDS.includes(a.to_kind as EntryKind)) throw destinationKindError();
+
+  // The body is snapshotted once: this exact text is validated, hashed for the
+  // approval and, with the one placeholder value replaced, sent.
+  let template: string;
+  let placeholderPath: string;
+  let toAuth: TransferAuth;
+  try {
+    if (!isRecord(a.body)) throw new TransferInputError("body must be a JSON object");
+    try {
+      template = JSON.stringify(a.body);
+    } catch {
+      throw new TransferInputError("body must be a JSON object");
+    }
+    if (Buffer.byteLength(template) > ENTRY_USE_LIMITS.maxRequestBytes) {
+      throw new ToolInputError("request_too_large", "body exceeds the broker request limit");
+    }
+    placeholderPath = locatePlaceholder(JSON.parse(template)).path;
+    toAuth = parseTransferAuth(a.to_auth);
+  } catch (err) {
+    if (err instanceof TransferInputError) throw new ToolInputError("invalid_arguments", err.message);
+    throw err;
+  }
+  const authHeader = toAuth.scheme === "header" ? toAuth.name : undefined;
+
+  const fromSite = reqStr(a, "from_site");
+  const toSite = reqStr(a, "to_site");
+  const fromAccount = optStr(a, "from_account");
+  const toAccount = optStr(a, "to_account");
+  const shown = (site: string, account: string | undefined) =>
+    `entry:${sanitizeDisplayText(site, 253) || "?"}/${account ? sanitizeDisplayText(account, 200) : "default"}`;
+  const unresolved = (reason: string): Plan => ({
+    capability,
+    resource: clip(`${shown(fromSite, fromAccount)}=>${shown(toSite, toAccount)}`, MAX_RESOURCE),
+    params: { method, url_path: path, task },
+    summary: "",
+    task,
+    run: async () => ({ result: { ok: false, error: reason } }),
+  });
+  // Without the scope the policy engine denies; do not resolve (or confirm the existence of) either entry first.
+  const scope = requiredScope(capability);
+  if (!scope || !env.identity.scopes.includes(scope)) return unresolved("missing_scope");
+
+  const resolve = async (role: "from" | "to", site: string, account: string | undefined): Promise<EntryMetadata> => {
+    try {
+      return await resolveEntry({ site, account, kind: a[`${role}_kind`] as EntryKind | undefined }, env.deps.cards);
+    } catch (err) {
+      if (err instanceof EntryError) throw new ToolInputError(err.code, `${role}_site: ${err.message}`);
+      throw err;
+    }
+  };
+  const from = await resolve("from", fromSite, fromAccount);
+  if (!TRANSFER_SOURCE_KINDS.includes(from.kind)) throw sourceKindError();
+  const to = await resolve("to", toSite, toAccount);
+  if (!TRANSFER_DESTINATION_KINDS.includes(to.kind)) throw destinationKindError();
+  if (authHeader && to.kind === "password") {
+    throw new ToolInputError("invalid_arguments", "to_auth: a header is only for api_key and oauth_token destination entries");
+  }
+  if (from.id === to.id) throw new ToolInputError("invalid_arguments", "the source and the destination must be different entries");
+
+  const host = (optStr(a, "host") ?? to.site).trim().toLowerCase();
+  if (host !== to.site && host !== `api.${to.site}`) {
+    throw new ToolInputError("hostname_not_allowed", `host must be ${to.site} or api.${to.site}`);
+  }
+  if (isBlockedHost(host)) throw new ToolInputError("hostname_not_allowed", "that host is not reachable through the broker");
+
+  // Everything the owner approves is bound here: an approval cannot be replayed
+  // for another pair of entries, request, body, field or auth header.
+  const params: Record<string, unknown> = {
+    from_entry_id: from.id,
+    to_entry_id: to.id,
+    method,
+    host,
+    url_path: path,
+    body_sha256: sha256(template),
+    placeholder_path: placeholderPath,
+    to_auth_scheme: toAuth.scheme,
+    task,
+  };
+  if (authHeader) params.to_auth_header = authHeader;
+
+  // The part the owner must not miss comes first; the task takes what is left of the summary's 500 characters.
+  const head =
+    `TRANSFER the secret of "${sanitizeDisplayText(from.label, 60)}" into ${method} https://${host}${clip(path, 100)}, ` +
+    `JSON field ${placeholderPath}, authenticated as "${sanitizeDisplayText(to.label, 60)}"${authHeader ? `, sent in header ${authHeader}` : ""}. ` +
+    `${to.site} will receive and may store this secret. Task: `;
+  const summary = `${head}${clip(task, Math.max(40, 500 - head.length))}`;
+
+  const resource = clip(`entry:${from.site}/${from.account}=>entry:${to.site}/${to.account}`, MAX_RESOURCE);
+  // What a ledger row of the transfer itself says: both entries by id, the request line, the field. No body, no secret.
+  const pathname = path.split(/[?#]/)[0];
+  const rowResource = (role: "source" | "destination") =>
+    clip(
+      `entry:${from.site}/${from.account} (${from.id}) => entry:${to.site}/${to.account} (${to.id}) [${role}] ${method} https://${host}${clip(pathname, 200)} field ${placeholderPath}`,
+      1024,
+    );
+
+  return {
+    capability,
+    resource,
+    params,
+    summary,
+    task,
+    run: async (ctx) => {
+      const ledger = env.deps.ledger ?? appendLedger;
+      let seen: { status: number } | null = null;
+      /** The request reached the point of leaving the broker; without a response read back, delivery is unknown. */
+      let connected = false;
+      let ledgered = false;
+      let preflight: string | null = null;
+      /** Why the destination side failed (its entry could not be used, the request failed, or its row could not be written). */
+      let destinationFailure: unknown = null;
+      let destination: EntryMetadata = to;
+      const audit: Audit = { credential_ref: to.ref };
+      const status = () => (seen as { status: number } | null)?.status;
+      const refuse = (code: string): never => {
+        preflight = code;
+        throw new SitePreflightError(code);
+      };
+      // One row per entry, written by useEntry (which fails closed when the "ok"
+      // row cannot be written), under this capability and the request's outcome.
+      const rowWriter = (role: "source" | "destination") => async (input: LedgerEntryInput) => {
+        ledgered = true;
+        const row: LedgerEntryInput = { ...input, capability, task, resource: rowResource(role) };
+        const s = status();
+        if (s !== undefined) row.http_status = s;
+        if (preflight) {
+          row.result = "error";
+          row.error = preflight;
+        } else if (s === 401) {
+          row.result = "error";
+          row.error = "site_rejected_credential";
+        } else if (s === 403) {
+          row.result = "error";
+          row.error = "site_forbidden";
+        } else if (role === "source" && destinationFailure !== null) {
+          // The source entry was opened but the transfer did not complete: never an "ok" row.
+          row.result = "error";
+          row.error = `transfer_failed: ${destinationFailure instanceof EntryError ? destinationFailure.code : "internal_error"}`;
+        }
+        await ledger(row);
+      };
+      const useOpts = (role: "source" | "destination") => ({
+        ...env.deps.cards,
+        decision: ctx.decision.decision,
+        tier: ctx.decision.tier,
+        approval_id: ctx.approvalId,
+        ledger: rowWriter(role),
+      });
+      try {
+        const used = await useEntry(
+          from.id,
+          env.identity,
+          task,
+          async (sourceSecret) => {
+            try {
+              const inner = await useEntry(
+                to.id,
+                env.identity,
+                task,
+                async (destinationSecret, meta) => {
+                  // redaction.ts arms only values of 8+ characters; a shorter one could come back unredacted.
+                  if (sourceSecret.trim().length < MIN_SECRET_LENGTH || destinationSecret.trim().length < MIN_SECRET_LENGTH) {
+                    refuse("entry_secret_unprotectable");
+                  }
+                  // The destination may echo what it was sent, verbatim or re-encoded.
+                  for (const form of transferRedactionForms(sourceSecret)) registerSecretForRedaction(form);
+                  const bodyText = buildTransferBody(template, sourceSecret);
+                  if (Buffer.byteLength(bodyText) > ENTRY_USE_LIMITS.maxRequestBytes) refuse("request_too_large");
+                  let response: Awaited<ReturnType<typeof siteRequest>>;
+                  try {
+                    response = await siteRequest(
+                      destinationSecret,
+                      meta,
+                      { host, method, path, bodyText, contentType: "application/json", authHeader, onConnect: () => void (connected = true) },
+                      env.deps,
+                    );
+                  } catch (err) {
+                    if (err instanceof SitePreflightError) preflight = err.code;
+                    throw err;
+                  }
+                  seen = { status: response.status };
+                  // A 401 is about the credential that authenticated the request: flag the
+                  // DESTINATION entry. The source entry is never flagged by this response.
+                  if (response.status === 401) {
+                    await flagForReentry(meta.id, `${host} answered ${response.status} to ${method}`, env.deps.cards).catch(() => {
+                      log.error("vault_entry_flag_failed", { entry_id: meta.id });
+                    });
+                  }
+                  // Status and redacted body only: no content type, no Location, no other header.
+                  const out: { status: number; body: unknown; truncated?: true } = { status: response.status, body: response.body };
+                  if (response.truncated) out.truncated = true;
+                  return out;
+                },
+                useOpts("destination"),
+              );
+              destination = inner.entry;
+              return inner.result;
+            } catch (err) {
+              destinationFailure = err;
+              throw err;
+            }
+          },
+          useOpts("source"),
+        );
+        const response = used.result;
+        audit.http_status = response.status;
+        if (response.status === 401) {
+          return {
+            ledgered,
+            audit,
+            result: {
+              ok: false,
+              error: "site_rejected_credential",
+              detail: `${host} answered ${response.status}. The destination entry is now flagged; ask the owner to re-enter it with entry_request_card (entry_id). The source entry is unchanged.`,
+              status: response.status,
+              entry_id: to.id,
+              entry_flagged_for_reentry: true,
+            },
+          };
+        }
+        if (response.status === 403) {
+          return {
+            ledgered,
+            audit,
+            result: {
+              ok: false,
+              error: "site_forbidden",
+              detail: `${host} answered ${response.status}. The destination credential was accepted but this request is not allowed; both entries are unchanged.`,
+              status: response.status,
+              body: response.body,
+              entry_id: to.id,
+            },
+          };
+        }
+        return { ledgered, audit, result: { ok: true, data: { from: agentEntryView(used.entry), to: agentEntryView(destination), ...response } } };
+      } catch (err) {
+        // Whether the request left the broker matters to the caller: if it did, the destination may hold the secret.
+        // true: a response was read. "unknown": the connection was opened but no response was read
+        // (timeout, disconnect, oversized answer), so the destination may or may not hold the secret.
+        const requestSent: boolean | "unknown" = seen !== null ? true : connected ? "unknown" : false;
+        if (preflight) {
+          return {
+            ledgered,
+            audit,
+            result: { ok: false, error: preflight, detail: TRANSFER_PREFLIGHT_DETAIL[preflight] ?? "Nothing was sent.", request_sent: false },
+          };
+        }
+        const failedSide = destinationFailure !== null ? "destination" : "source";
+        const failure = entryFailure(destinationFailure ?? err);
+        return {
+          ledgered,
+          audit,
+          result: { ...failure, failed_entry: failedSide, entry_id: failedSide === "destination" ? to.id : from.id, request_sent: requestSent },
+        };
       }
     },
   };
@@ -2139,6 +2512,7 @@ const PLANNERS: Readonly<Record<string, Planner>> = Object.freeze({
     };
   },
   entry_inject: (a, env) => entryInjectPlan(a, env),
+  entry_transfer: entryTransferPlan,
   // Browser injectors (injector.ts). The enroll result carries the injector token ONCE, under a key
   // the result redaction does not blank ("injector_token"); it is never ledgered or logged.
   admin_enroll_injector: (a, env) => {
