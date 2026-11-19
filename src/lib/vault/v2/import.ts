@@ -91,7 +91,8 @@ export type SkipReason =
   | "generic_not_requested"
   | "provider_not_selected"
   | "no_fingerprint"
-  | "invalid_site";
+  | "invalid_site"
+  | "legacy_decrypt_failed";
 
 export interface SkippedFinding {
   path: string;
@@ -160,6 +161,12 @@ const NAME_HINTS: ReadonlyArray<readonly [RegExp, string]> = [
   [/youtube|gemini|google/i, "google.com"],
   [/(^|_)aws(_|$)/i, "aws.amazon.com"],
 ];
+
+/** The site a variable or service NAME identifies ("TWILIO_AUTH_TOKEN" → twilio.com), or null. */
+export function siteFromName(name: string | null | undefined): string | null {
+  const hint = NAME_HINTS.find(([re]) => re.test(name ?? ""));
+  return hint ? hint[1] : null;
+}
 
 function siteForFinding(f: ScanFinding, opts: PlanOptions): { site: string } | { reason: SkipReason } {
   const blocked = UNIMPORTABLE[f.provider];

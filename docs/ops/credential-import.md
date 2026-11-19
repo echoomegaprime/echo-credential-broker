@@ -171,3 +171,35 @@ its scan fingerprint appended (`youtube_api_key-1a2b3c4d`), never dropped.
   card-entered entry.
 - It does not import passwords, cookies, private keys or URL credentials. Those
   go through a card.
+
+## The old Cloudflare vault
+
+`scripts/vault-import-cloudflare.ts` imports the old vault (worker
+`echo-vault-api`, D1 `echo-master-vault`). It runs on the vault host like the
+scan importer and uses the same storing, dedup and ledger path.
+
+It reads the old vault through the old worker's own API (`/list`, then
+`/get?id=…&reveal=true`), so the worker does the decrypting and the D1
+encryption key is never needed. The worker's API key is taken by reference:
+`--api-key-env NAME` (a variable of the process) or `--api-key-service name`
+(a Master Vault entry on the gate). It is never an argument.
+
+```
+cd /mnt/storage/echo-vault-v2/app
+node --experimental-strip-types scripts/vault-import-cloudflare.ts --report ~/vault-import/cf-preview.json
+node --experimental-strip-types scripts/vault-import-cloudflare.ts --report ~/vault-import/cf-report.json --apply
+```
+
+- A `password` column becomes an entry of kind `password`, an `api_key` column
+  kind `api_key`. The account is the old row's username, else the service name.
+- The site comes from the old row's service: a URL or domain as written, or a
+  known service name (`Twilio` → `twilio.com`). A service that names no known
+  site is skipped as `unknown_provider`; `--include-unmapped` imports it under
+  `<service>.legacy-vault.invalid`, which matches no real host until renamed.
+- Notes and tags of the old rows are not read.
+- The old worker allows 60 requests a minute, so the run takes about one second
+  per row. It writes one audit row per read in the old vault and changes nothing
+  else there.
+- Failure codes on stdout: `source_key_not_found`, `source_key_rejected`,
+  `source_unavailable` (the old worker answered with an error, for example when
+  the D1 daily read limit is spent), `source_unreachable`, `gate_unavailable`.
