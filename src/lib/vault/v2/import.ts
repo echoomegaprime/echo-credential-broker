@@ -91,7 +91,8 @@ export type SkipReason =
   | "generic_not_requested"
   | "provider_not_selected"
   | "no_fingerprint"
-  | "invalid_site";
+  | "invalid_site"
+  | "legacy_decrypt_failed";
 
 export interface SkippedFinding {
   path: string;
@@ -160,6 +161,12 @@ const NAME_HINTS: ReadonlyArray<readonly [RegExp, string]> = [
   [/youtube|gemini|google/i, "google.com"],
   [/(^|_)aws(_|$)/i, "aws.amazon.com"],
 ];
+
+/** The site a variable or service NAME identifies ("TWILIO_AUTH_TOKEN" → twilio.com), or null. */
+export function siteFromName(name: string | null | undefined): string | null {
+  const hint = NAME_HINTS.find(([re]) => re.test(name ?? ""));
+  return hint ? hint[1] : null;
+}
 
 function siteForFinding(f: ScanFinding, opts: PlanOptions): { site: string } | { reason: SkipReason } {
   const blocked = UNIMPORTABLE[f.provider];
@@ -257,7 +264,7 @@ export function planImport(manifest: ScanManifest, opts: PlanOptions = {}): Impo
     const kind: EntryKind = "api_key";
     const fallback = `imported-${fp.slice(0, 8)}`;
     let account = accountFromKeyName(group.keyName) ?? fallback;
-    if (taken.has(`${group.site}\n${account}`)) account = `${account}-${fp.slice(0, 8)}`.slice(0, 254);
+    if (taken.has(`${group.site}\n${account}`)) account = `${account.slice(0, 254 - 9)}-${fp.slice(0, 8)}`;
     taken.add(`${group.site}\n${account}`);
     const purpose = purposeFor(node, group.first.file ?? basenameOf(group.first.path));
     entries.push({
@@ -406,7 +413,7 @@ export async function applyImport(plan: ImportPlan, deps: ImportDeps): Promise<I
     // another node). That is a second credential, not a duplicate: give it the
     // fingerprint-suffixed account instead of dropping it.
     const suffix = `-${p.scan_fingerprint.slice(0, 8)}`;
-    const accounts = p.account.endsWith(suffix) ? [p.account] : [p.account, `${p.account}${suffix}`.slice(0, 254)];
+    const accounts = p.account.endsWith(suffix) ? [p.account] : [p.account, `${p.account.slice(0, 254 - suffix.length)}${suffix}`];
     let outcome: "free" | "exists" | "conflict" | "store_down" = "conflict";
     let existingId: string | undefined;
     for (const account of accounts) {
