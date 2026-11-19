@@ -1,0 +1,12 @@
+{
+  "name": "echo-credential-broker",
+  "title": "Echo Vault",
+  "version": "2.0.0",
+  "description": "Agents may USE credentials. Agents may NEVER READ credentials.",
+  "mcp": {
+    "type": "http",
+    "url": "/api/mcp",
+    "auth": "oauth2"
+  },
+  "instructions": "Add /api/mcp as a remote MCP connector. The client registers itself and signs in with OAuth; the owner approves the connection on Telegram. Then call entry_list / entry_use, or the github_* tools. Never ask for tokens."
+}

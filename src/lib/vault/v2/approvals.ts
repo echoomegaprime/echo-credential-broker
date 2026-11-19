@@ -466,6 +466,30 @@ function mapStatus(status: ApprovalStatus): ConsumeResult {
   }
 }
 
+/**
+ * Whether `id` is an approved, unexpired approval of exactly this request —
+ * WITHOUT consuming it. For a bounded session (node import) that makes several
+ * calls under one owner decision and then closes it with consumeApproval.
+ * Same result codes as consumeApproval; "ok" means approved and still open.
+ */
+export async function checkApproval(
+  id: string,
+  req: CapabilityRequest,
+  opts: ApprovalOptions = {},
+): Promise<ConsumeResult> {
+  if (typeof id !== "string" || !ID_PATTERN.test(id)) return "not_found";
+  const store = opts.store ?? getDefaultApprovalStore();
+  const nowMs = (opts.now ?? Date.now)();
+  const rec = await store.get(id);
+  if (!rec) return "not_found";
+  if (!constantTimeEqual(rec.request_digest, requestDigest(req))) {
+    log.warn("vault_approval_digest_mismatch", { approval_id: id, client_id: req?.client?.client_id });
+    return "digest_mismatch";
+  }
+  const status = effectiveStatus(rec, nowMs);
+  return status === "approved" ? "ok" : mapStatus(status);
+}
+
 export async function consumeApproval(
   id: string,
   req: CapabilityRequest,
