@@ -238,9 +238,25 @@ describe("node import: submit", () => {
     assert.equal((await w.entries.list({})).length, 1);
   });
 
+  it("malformed items spend the approved budget, so a session cannot push unbounded secrets", async () => {
+    const w = world();
+    const terms = { ...TERMS, planned: 2 };
+    const s = await begin(w, terms);
+    await w.approve(s.body.approval_id);
+    const junk = [item(SECRETS.github, "not-a-fingerprint"), item(SECRETS.github2, "also-bad")];
+    const first = await handleImportSubmit(post("submit", { ...terms, approval_id: s.body.approval_id, items: junk }, s.secret), w.deps);
+    assert.equal(((await first.json()) as { malformed: number }).malformed, 2);
+    const second = await handleImportSubmit(post("submit", { ...terms, approval_id: s.body.approval_id, items: [item(SECRETS.google, "b".repeat(16), { detector: "google_api_key", provider: "google.com" })] }, s.secret), w.deps);
+    const body = (await second.json()) as { over_plan: number; counts: Record<string, number> };
+    assert.equal(body.over_plan, 1);
+    assert.equal(body.counts.imported, 0);
+    assert.equal((await w.entries.list({})).length, 0);
+  });
+
   it("drops malformed items and oversize batches without storing them", async () => {
     const w = world();
-    const s = await begin(w);
+    const TERMS = { node: "temper", planned: 40, apply: true, include_generic: false };
+    const s = await begin(w, TERMS);
     await w.approve(s.body.approval_id);
     const bad = [
       item(SECRETS.github, "not-a-fingerprint"),

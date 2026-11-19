@@ -183,57 +183,71 @@ async function main() {
   }
   const { groups, skipped } = groupFindings(manifest.findings ?? [], { includeGeneric: args.includeGeneric });
   const { items: all, unreadable } = await attachSecrets(groups, key);
-  const items = all.slice(0, MAX_PLANNED);
-  say({ step: "scanned", node, findings: (manifest.findings ?? []).length, distinct_secrets: groups.length, not_sendable: skipped, unreadable, to_send: items.length, held_back: all.length - items.length });
-  if (items.length === 0) {
+  say({ step: "scanned", node, findings: (manifest.findings ?? []).length, distinct_secrets: groups.length, not_sendable: skipped, unreadable, to_send: all.length, sessions: Math.ceil(all.length / MAX_PLANNED) });
+  if (all.length === 0) {
     say({ ok: true, node, nothing_to_import: true });
     return 0;
   }
-
-  const session = randomBytes(32).toString("base64url");
-  const terms = { node, planned: items.length, apply: args.apply, include_generic: args.includeGeneric };
-  const began = await call(vault.origin, "begin", { ...terms, session_hash: createHash("sha256").update(session, "utf8").digest("hex") });
-  if (began.status !== 200 || !began.json?.approval_id) {
-    say({ ok: false, step: "begin", status: began.status, error: began.json?.error ?? "begin_failed" });
-    return 1;
-  }
-  const approvalId = began.json.approval_id;
-  say({ step: "waiting_for_owner", node, pairing_code: began.json.pairing_code, expires_at: began.json.expires_at, mode: args.apply ? "import" : "preview" });
 
   const counts = {};
   const entries = [];
   let malformed = 0;
   let overPlan = 0;
   const skippedByVault = {};
-  for (let i = 0; i < items.length; i += BATCH) {
-    const batch = items.slice(i, i + BATCH).map((it) => ({
-      fingerprint: it.fingerprint,
-      detector: it.detector,
-      provider: it.provider,
-      key_name: it.key_name,
-      secret: it.secret,
-      sources: it.sources,
-    }));
-    let res;
-    for (;;) {
-      res = await call(vault.origin, "submit", { ...terms, approval_id: approvalId, items: batch }, session);
-      if (res.status === 409 && res.json?.error === "approval_pending") {
-        await sleep(5000);
-        continue;
-      }
-      break;
-    }
-    if (res.status !== 200 || !res.json?.ok) {
-      say({ ok: false, step: "submit", status: res.status, error: res.json?.error ?? "submit_failed", sent_before_failure: i });
+  // One owner approval covers at most MAX_PLANNED credentials. A bigger node is
+  // sent as consecutive sessions, each with its own prompt, so every credential
+  // is reached in one run.
+  for (let start = 0; start < all.length; start += MAX_PLANNED) {
+    const items = all.slice(start, start + MAX_PLANNED);
+    const session = randomBytes(32).toString("base64url");
+    const terms = { node, planned: items.length, apply: args.apply, include_generic: args.includeGeneric };
+    const began = await call(vault.origin, "begin", { ...terms, session_hash: createHash("sha256").update(session, "utf8").digest("hex") });
+    if (began.status !== 200 || !began.json?.approval_id) {
+      say({ ok: false, step: "begin", status: began.status, error: began.json?.error ?? "begin_failed", sent_before_failure: start });
       return 1;
     }
-    for (const [k, v] of Object.entries(res.json.counts ?? {})) counts[k] = (counts[k] ?? 0) + v;
-    for (const [k, v] of Object.entries(res.json.skipped ?? {})) skippedByVault[k] = (skippedByVault[k] ?? 0) + v;
-    malformed += res.json.malformed ?? 0;
-    overPlan += res.json.over_plan ?? 0;
-    for (const e of res.json.entries ?? []) entries.push(e);
+    const approvalId = began.json.approval_id;
+    say({
+      step: "waiting_for_owner",
+      node,
+      session: start / MAX_PLANNED + 1,
+      credentials: items.length,
+      pairing_code: began.json.pairing_code,
+      expires_at: began.json.expires_at,
+      mode: args.apply ? "import" : "preview",
+    });
+
+    for (let i = 0; i < items.length; i += BATCH) {
+      const batch = items.slice(i, i + BATCH).map((it) => ({
+        fingerprint: it.fingerprint,
+        detector: it.detector,
+        provider: it.provider,
+        key_name: it.key_name,
+        secret: it.secret,
+        sources: it.sources,
+      }));
+      let res;
+      for (;;) {
+        res = await call(vault.origin, "submit", { ...terms, approval_id: approvalId, items: batch }, session);
+        if (res.status === 409 && res.json?.error === "approval_pending") {
+          await sleep(5000);
+          continue;
+        }
+        break;
+      }
+      if (res.status !== 200 || !res.json?.ok) {
+        say({ ok: false, step: "submit", status: res.status, error: res.json?.error ?? "submit_failed", sent_before_failure: start + i });
+        return 1;
+      }
+      for (const [k, v] of Object.entries(res.json.counts ?? {})) counts[k] = (counts[k] ?? 0) + v;
+      for (const [k, v] of Object.entries(res.json.skipped ?? {})) skippedByVault[k] = (skippedByVault[k] ?? 0) + v;
+      malformed += res.json.malformed ?? 0;
+      overPlan += res.json.over_plan ?? 0;
+      for (const e of res.json.entries ?? []) entries.push(e);
+    }
+    await call(vault.origin, "finish", { ...terms, approval_id: approvalId }, session).catch(() => null);
   }
-  await call(vault.origin, "finish", { ...terms, approval_id: approvalId }, session).catch(() => null);
+  const items = all;
 
   const reportPath = resolve(args.report ?? join(homedir(), ".echo-vault-scan", "import-report.json"));
   mkdirSync(dirname(reportPath), { recursive: true });

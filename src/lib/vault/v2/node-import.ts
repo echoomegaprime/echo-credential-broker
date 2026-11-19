@@ -25,7 +25,9 @@
  *     inside the approved request digest. A different node, count or mode is a
  *     different digest and is refused.
  *   - One owner decision per node per run, open for at most 30 minutes, capped
- *     at the number of credentials the owner was shown.
+ *     at the number of credentials the owner was shown. Every submitted item
+ *     spends that budget before it is read, so malformed or repeated items
+ *     cannot be used to make the vault hold more than the approved count.
  *   - `begin` is the one unauthenticated call. It is globally rate limited and
  *     fails closed, so it cannot be used to flood the approver.
  *   - Submitted secrets are registered for redaction before anything else
@@ -269,29 +271,30 @@ export async function handleImportSubmit(request: Request, deps: NodeImportDeps 
   }
   if (state !== "ok") return refuse(...APPROVAL_HTTP[state]);
 
-  const items: SubmittedItem[] = [];
-  let malformed = 0;
-  const seen = new Set<string>();
-  for (const raw of rawItems) {
-    const item = readItem(raw);
-    if (!item || seen.has(item.finding.fingerprint as string)) {
-      malformed++;
-      continue;
-    }
-    seen.add(item.finding.fingerprint as string);
-    items.push(item);
-  }
-
   // The owner approved `planned` credentials for this session, not an open door.
+  // The budget is taken per submitted item BEFORE the item is read, so a session
+  // can never make the vault hold (or register for redaction) more secrets than
+  // the approved count — malformed and repeated items spend budget too.
   const accepted: SubmittedItem[] = [];
+  let malformed = 0;
   let overPlan = 0;
+  const seen = new Set<string>();
   try {
-    for (const item of items) {
+    for (const raw of rawItems) {
       const hit = await withRateLimitStore(limitsOf(deps), "hit", (s) =>
         s.hit(rateLimitKey("import.entries", approvalId), HOUR_MS, nowOf(deps), terms.planned),
       );
-      if (hit.recorded) accepted.push(item);
-      else overPlan++;
+      if (!hit.recorded) {
+        overPlan++;
+        continue;
+      }
+      const item = readItem(raw);
+      if (!item || seen.has(item.finding.fingerprint as string)) {
+        malformed++;
+        continue;
+      }
+      seen.add(item.finding.fingerprint as string);
+      accepted.push(item);
     }
   } catch {
     return refuse(503, "unavailable");

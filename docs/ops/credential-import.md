@@ -98,8 +98,12 @@ machine). The vault accepts at most 8 import prompts per hour in total.
 | `too_many_import_requests` | More than 8 prompts in the last hour. Wait and retry. |
 | `over_plan` (count) | The node tried to send more than the approved count; the extras were not stored. |
 
-A node with more than 2000 distinct credentials sends the first 2000; run it
-again for the rest (already-stored ones are skipped).
+One approval covers at most 2000 credentials. A node with more is sent as
+consecutive sessions in the same run, each with its own prompt and pairing code.
+
+Every item a node submits counts against the approved number, including items
+the vault rejects as malformed. A session can never make the vault hold more
+secrets than the count you approved.
 
 ## What you see
 
