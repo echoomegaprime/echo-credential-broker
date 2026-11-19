@@ -1,0 +1,1 @@
+{"mcpServers":{"echo-vault-local":{"args":["--experimental-strip-types","scripts/mcp-stdio.ts"],"command":"node","cwd":"/ABSOLUTE/PATH/TO/echo-credential-broker","env":{"ECHO_AGENT":"gemini-cli"}},"echo-vault-remote":{"httpUrl":"https://credbroker.echo-op.com/api/mcp","oauth":{"enabled":true}}}}
