@@ -92,8 +92,8 @@ function purposeFor(category: string): string {
 }
 
 /**
- * Rows → plan. Pure and deterministic. One entry per distinct secret and kind:
- * the same key stored under two old rows is one entry listing both. A password
+ * Rows → plan. Pure and deterministic. One entry per distinct secret, kind and
+ * site: the same key stored under two old rows of one site is one entry listing both. A password
  * column becomes kind `password`, an api_key column kind `api_key`.
  */
 export function planLegacyVault(items: LegacyItem[], opts: LegacyPlanOptions = {}): ImportPlan {
@@ -129,7 +129,8 @@ export function planLegacyVault(items: LegacyItem[], opts: LegacyPlanOptions = {
       continue;
     }
     const kind: EntryKind = item.field === "password" ? "password" : "api_key";
-    const key = `${item.fingerprint}\n${kind}`;
+    // The site is part of the identity: one password reused on two sites is two entries.
+    const key = `${item.fingerprint}\n${kind}\n${site}`;
     const known = groups.get(key);
     if (known) known.sources.push(source);
     else groups.set(key, { site, first: item, kind, sources: [source] });
@@ -141,7 +142,7 @@ export function planLegacyVault(items: LegacyItem[], opts: LegacyPlanOptions = {
     const fp = key.slice(0, 16);
     let account = accountFor(group.first, `imported-${fp.slice(0, 8)}`);
     const identity = () => `${group.site}\n${group.kind}\n${account}`;
-    if (taken.has(identity())) account = `${account}-${fp.slice(0, 8)}`.slice(0, 254);
+    if (taken.has(identity())) account = `${account.slice(0, 254 - 9)}-${fp.slice(0, 8)}`;
     taken.add(identity());
     const purpose = purposeFor(group.first.category);
     entries.push({

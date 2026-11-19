@@ -148,6 +148,29 @@ describe("planLegacyVault", () => {
   });
 });
 
+describe("planLegacyVault identities", () => {
+  it("keeps one password reused on two sites as two entries", () => {
+    const shared = fp("pw" + "-shared-0123456789");
+    const plan = planLegacyVault([
+      { id: 1, service: "github.com", username: "alice", category: "dev", field: "password", fingerprint: shared },
+      { id: 2, service: "google.com", username: "alice", category: "dev", field: "password", fingerprint: shared },
+      { id: 3, service: "GitHub", username: "alice2", category: "dev", field: "password", fingerprint: shared },
+    ]);
+    assert.deepEqual(plan.entries.map((e) => [e.site, e.sources.length]), [["github.com", 2], ["google.com", 1]]);
+  });
+
+  it("keeps the collision suffix at the account length limit", () => {
+    const long = "u".repeat(254);
+    const plan = planLegacyVault([
+      { id: 1, service: "stripe", username: long, category: "pay", field: "api_key", fingerprint: fp("k1" + "-0123456789abcdef") },
+      { id: 2, service: "stripe", username: long, category: "pay", field: "api_key", fingerprint: fp("k2" + "-0123456789abcdef") },
+    ]);
+    const accounts = plan.entries.map((e) => e.account);
+    assert.equal(new Set(accounts).size, 2);
+    assert.ok(accounts.every((a) => a.length <= 254));
+  });
+});
+
 describe("legacy import end to end", () => {
   it("previews without writing, imports once, and finds everything on a second run", async () => {
     const w = world();
