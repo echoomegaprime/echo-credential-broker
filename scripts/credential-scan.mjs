@@ -29,7 +29,7 @@ import { homedir, hostname, platform } from "node:os";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-export const SCANNER_VERSION = "1.0.0";
+export const SCANNER_VERSION = "1.1.0";
 
 const DEFAULT_MAX_FILE_BYTES = 2 * 1024 * 1024;
 
@@ -123,6 +123,7 @@ export function scanText(text, key) {
     const line = lines[i];
     if (line.length > 20_000) continue; // minified blobs: not a config line
     const covered = [];
+    const coveredFindings = [];
     for (const d of DETECTORS) {
       d.re.lastIndex = 0;
       let m;
@@ -132,14 +133,16 @@ export function scanText(text, key) {
         if (seen.has(dedupe)) continue;
         seen.add(dedupe);
         covered.push(value);
-        findings.push({
+        const finding = {
           line: i + 1,
           detector: d.id,
           provider: d.provider,
           key_name: null,
           length: d.marker ? null : value.length,
           fingerprint: d.marker ? null : fingerprint(value, key),
-        });
+        };
+        coveredFindings.push(finding);
+        findings.push(finding);
         if (m[0].length === 0) d.re.lastIndex++;
       }
     }
@@ -150,7 +153,12 @@ export function scanText(text, key) {
       const value = a[2] ?? a[3] ?? a[4] ?? "";
       if (!SECRET_KEY_RE.test(name)) continue;
       if (PLACEHOLDER_RE.test(value)) continue;
-      if (covered.some((c) => value.includes(c) || c.includes(value))) continue; // already a provider hit
+      const hit = covered.findIndex((c) => value.includes(c) || c.includes(value));
+      if (hit >= 0) {
+        // Already a provider hit: keep the one finding, and remember which variable held it.
+        if (coveredFindings[hit].key_name === null) coveredFindings[hit].key_name = name.slice(0, 80);
+        continue;
+      }
       if (value.length < 12 || entropy(value) < 3.0) continue;
       if (/^[a-z]+(?:[_-][a-z]+)*$/i.test(value) && value.length < 24) continue; // a word, not a secret
       findings.push({
@@ -164,6 +172,45 @@ export function scanText(text, key) {
     }
   }
   return findings;
+}
+
+/**
+ * The secret a finding points at, read back from that line of the file.
+ *
+ * This is the one function here that returns a secret VALUE. It exists for the
+ * on-box importer (scripts/vault-import.ts), which hands the value straight to
+ * the vault backend. It must never be wired to stdout, a log or a manifest.
+ * Returns null when the line no longer holds the secret the manifest recorded
+ * (the file changed since the scan) or the finding has no fingerprint.
+ *
+ * @param {string} lineText one line of the source file
+ * @param {{ detector: string, fingerprint: string | null }} finding
+ * @param {Buffer | string} key the node HMAC key the manifest was written with
+ * @returns {string | null}
+ */
+export function locateSecret(lineText, finding, key) {
+  if (typeof lineText !== "string" || !finding || typeof finding.fingerprint !== "string") return null;
+  if (lineText.length > 20_000) return null;
+  const matches = (value) => typeof value === "string" && value.length > 0 && fingerprint(value, key) === finding.fingerprint;
+  if (finding.detector === "generic_assignment") {
+    ASSIGN_RE.lastIndex = 0;
+    let a;
+    while ((a = ASSIGN_RE.exec(lineText)) !== null) {
+      const value = a[2] ?? a[3] ?? a[4] ?? "";
+      if (matches(value)) return value;
+    }
+    return null;
+  }
+  const d = DETECTORS.find((x) => x.id === finding.detector);
+  if (!d || d.marker) return null;
+  d.re.lastIndex = 0;
+  let m;
+  while ((m = d.re.exec(lineText)) !== null) {
+    const value = m[1] ?? m[0];
+    if (matches(value)) return value;
+    if (m[0].length === 0) d.re.lastIndex++;
+  }
+  return null;
 }
 
 function looksBinary(buf) {
