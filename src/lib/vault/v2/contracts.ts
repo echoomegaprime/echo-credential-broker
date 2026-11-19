@@ -63,7 +63,7 @@ export interface ApprovalRecord {
   created_at: string;
   expires_at: string;
   decided_at?: string;
-  /** Telegram user ID of the approver, as a string. */
+  /** Who decided: the approver's Telegram user ID (owner path), or "service:lyra-consent-bridge" (bridge path). */
   decided_by?: string;
 }
 

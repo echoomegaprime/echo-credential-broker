@@ -7,6 +7,11 @@
  *                                 [Approve] [Deny] inline keyboard.
  *   decideApproval(...)           called by the Telegram webhook: MAC + approver
  *                                 identity + pending + unexpired → approved/denied.
+ *   decideApprovalAsService(...)  the second decider: Lyra's consent bridge,
+ *                                 authenticated by its own service token, may
+ *                                 decide connection + first-use approvals only;
+ *                                 decisions are recorded as
+ *                                 client_id "service:lyra-consent-bridge".
  *   consumeApproval(id, req)      approved → consumed exactly once, only for the
  *                                 identical request, only before expiry.
  *
@@ -586,6 +591,39 @@ export async function decideApproval(
     return reject("bad_mac", id);
   }
 
+  return applyDecision(rec, action, { decidedBy: telegramUserId, ledgerClientId: OWNER_DECIDER_CLIENT_ID, actor: "owner" }, opts);
+}
+
+/** client_id on the ledger row that records the owner's Telegram decision. */
+export const OWNER_DECIDER_CLIENT_ID = "owner:telegram";
+
+/** How a decision is attributed: whose name the record and the ledger carry. */
+interface DecisionAttribution {
+  /** Stored on the approval record as `decided_by`. */
+  decidedBy: string;
+  /** client_id of the ledger row that records the decision. */
+  ledgerClientId: string;
+  /** Actor phrase in the ledger task text: "<actor> approved the request of …". */
+  actor: string;
+}
+
+/**
+ * The shared decision core, used by every decider after it has authenticated
+ * in its own way: expiry/pending checks, the decision written to the
+ * hash-chained ledger BEFORE it takes effect (nothing is ever approved or
+ * denied without an audit row — if the row cannot be written the decision is
+ * refused and the approval stays pending), the atomic decide, and the race
+ * report. Attribution comes from the caller, so a decision is always recorded
+ * under its real decider.
+ */
+async function applyDecision(
+  rec: ApprovalRecord,
+  action: ApprovalAction,
+  attribution: DecisionAttribution,
+  opts: ApprovalOptions,
+): Promise<DecideResult> {
+  const id = rec.id;
+  const store = opts.store ?? getDefaultApprovalStore();
   const nowMs = (opts.now ?? Date.now)();
   const status = effectiveStatus(rec, nowMs);
   if (status === "expired") {
@@ -595,12 +633,9 @@ export async function decideApproval(
   if (status !== "pending") return reject("not_pending", id, rec);
 
   const next = action === "approve" ? "approved" : "denied";
-  // The owner's decision goes on the hash-chained ledger BEFORE it takes effect,
-  // so nothing is ever approved or denied without an audit row. If the row cannot
-  // be written the tap is refused and the approval stays pending (tap again).
   const sink = opts.ledger ?? defaultLedgerSink;
   const decisionRow = (result: "ok" | "denied" | "error", error?: string): LedgerEntryInput => ({
-    client_id: "owner:telegram",
+    client_id: attribution.ledgerClientId,
     capability: APPROVAL_DECISION_CAPABILITY,
     resource: sanitizeDisplayText(`${rec.capability} ${rec.resource}`, 300),
     decision: action === "approve" ? "allow" : "deny",
@@ -608,7 +643,7 @@ export async function decideApproval(
     result,
     approval_id: id,
     error,
-    task: sanitizeDisplayText(`owner ${next} the request of ${rec.client_id}`, 300),
+    task: sanitizeDisplayText(`${attribution.actor} ${next} the request of ${rec.client_id}`, 300),
   });
   try {
     await sink(decisionRow(action === "approve" ? "ok" : "denied"));
@@ -616,7 +651,7 @@ export async function decideApproval(
     log.error("vault_approval_decision_unledgered", { approval_id: id });
     return reject("ledger_unavailable", id, rec);
   }
-  const updated = await store.decide(id, next, telegramUserId, new Date(nowMs).toISOString());
+  const updated = await store.decide(id, next, attribution.decidedBy, new Date(nowMs).toISOString());
   if (!updated) {
     // Lost a race (decided or expired in between): say so on the ledger too.
     await sink(decisionRow("error", "not_applied")).catch(() => undefined);
@@ -626,4 +661,84 @@ export async function decideApproval(
   }
   log.info("vault_approval_decided", { approval_id: id, status: next });
   return { ok: true, status: next, record: updated };
+}
+
+// ------------------------------------------------------------------ bridge decider
+
+/** client_id recorded for every decision made by Lyra's consent bridge. */
+export const BRIDGE_DECIDER_CLIENT_ID = "service:lyra-consent-bridge";
+
+/**
+ * The only approval kinds the bridge decider may decide:
+ *   - "vault.client.authorize" — OAuth connection approvals (bootstrap.ts);
+ *   - "vault.entry.use.read"   — first-use entry-read consent approvals
+ *     (the gateway's needsConsent path is the only creator of these).
+ * Every other capability stays owner-only, however the bridge authenticates.
+ */
+export const BRIDGE_DECIDABLE_CAPABILITIES: ReadonlySet<string> = new Set(["vault.client.authorize", "vault.entry.use.read"]);
+
+const MIN_BRIDGE_TOKEN_LENGTH = 32;
+
+/** The consent bridge's service token, or null when unset/too short (fail closed). */
+export function bridgeDeciderToken(env: NodeJS.ProcessEnv = process.env): string | null {
+  const raw = env.ECHO_VAULT_BRIDGE_DECIDER_TOKEN;
+  if (!raw || raw.length < MIN_BRIDGE_TOKEN_LENGTH) return null;
+  registerSecretForRedaction(raw);
+  return raw;
+}
+
+export type ServiceDecideRejectReason =
+  | DecideRejectReason
+  | "service_not_configured"
+  | "unauthorized_service"
+  | "out_of_scope";
+
+export type ServiceDecideResult =
+  | { ok: true; status: "approved" | "denied"; record: ApprovalRecord }
+  | { ok: false; reason: ServiceDecideRejectReason; record?: ApprovalRecord };
+
+function serviceReject(reason: ServiceDecideRejectReason, id: unknown, record?: ApprovalRecord): ServiceDecideResult {
+  log.warn("vault_bridge_decision_rejected", {
+    reason,
+    approval_id: typeof id === "string" && ID_PATTERN.test(id) ? id : "invalid",
+  });
+  return record ? { ok: false, reason, record } : { ok: false, reason };
+}
+
+/**
+ * Record a decision by the second decider: Lyra's consent bridge. The bridge
+ * authenticates with its own service token (ECHO_VAULT_BRIDGE_DECIDER_TOKEN)
+ * — never with the owner's Telegram identity and never with a callback MAC —
+ * and may decide ONLY the approval kinds in BRIDGE_DECIDABLE_CAPABILITIES.
+ * The decision is ledgered under client_id "service:lyra-consent-bridge" and
+ * the record's decided_by carries the same value, so bridge decisions are
+ * distinguishable from the owner's ("owner:telegram") forever.
+ */
+export async function decideApprovalAsService(
+  id: string,
+  action: ApprovalAction,
+  serviceToken: string,
+  opts: ApprovalOptions = {},
+): Promise<ServiceDecideResult> {
+  const env = opts.env ?? process.env;
+  if (action !== "approve" && action !== "deny") return serviceReject("invalid_action", id);
+
+  const expected = bridgeDeciderToken(env);
+  if (!expected) return serviceReject("service_not_configured", id);
+  if (typeof serviceToken !== "string" || !constantTimeEqual(serviceToken, expected)) {
+    return serviceReject("unauthorized_service", id);
+  }
+
+  if (typeof id !== "string" || !ID_PATTERN.test(id)) return serviceReject("not_found", id);
+  const store = opts.store ?? getDefaultApprovalStore();
+  const rec = await store.get(id);
+  if (!rec) return serviceReject("not_found", id);
+  if (!BRIDGE_DECIDABLE_CAPABILITIES.has(rec.capability)) return serviceReject("out_of_scope", id, rec);
+
+  return applyDecision(
+    rec,
+    action,
+    { decidedBy: BRIDGE_DECIDER_CLIENT_ID, ledgerClientId: BRIDGE_DECIDER_CLIENT_ID, actor: BRIDGE_DECIDER_CLIENT_ID },
+    opts,
+  );
 }

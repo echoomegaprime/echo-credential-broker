@@ -28,6 +28,7 @@ import { Route as ApiOauthRevokeRouteImport } from './routes/api/oauth/revoke'
 import { Route as ApiOauthTokenRouteImport } from './routes/api/oauth/token'
 import { Route as ApiRestToolRouteImport } from './routes/api/rest/tool'
 import { Route as ApiTelegramWebhookRouteImport } from './routes/api/telegram/webhook'
+import { Route as ApiInternalApprovalsDecideRouteImport } from './routes/api/internal/approvals/decide'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -127,6 +128,12 @@ const ApiTelegramWebhookRoute = ApiTelegramWebhookRouteImport.update({
   path: '/api/telegram/webhook',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ApiInternalApprovalsDecideRoute =
+  ApiInternalApprovalsDecideRouteImport.update({
+    id: '/api/internal/approvals/decide',
+    path: '/api/internal/approvals/decide',
+    getParentRoute: () => rootRouteImport,
+  } as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
@@ -148,6 +155,7 @@ export interface FileRoutesByFullPath {
   '/api/oauth/token': typeof ApiOauthTokenRoute
   '/api/rest/tool': typeof ApiRestToolRoute
   '/api/telegram/webhook': typeof ApiTelegramWebhookRoute
+  '/api/internal/approvals/decide': typeof ApiInternalApprovalsDecideRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
@@ -169,6 +177,7 @@ export interface FileRoutesByTo {
   '/api/oauth/token': typeof ApiOauthTokenRoute
   '/api/rest/tool': typeof ApiRestToolRoute
   '/api/telegram/webhook': typeof ApiTelegramWebhookRoute
+  '/api/internal/approvals/decide': typeof ApiInternalApprovalsDecideRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -191,6 +200,7 @@ export interface FileRoutesById {
   '/api/oauth/token': typeof ApiOauthTokenRoute
   '/api/rest/tool': typeof ApiRestToolRoute
   '/api/telegram/webhook': typeof ApiTelegramWebhookRoute
+  '/api/internal/approvals/decide': typeof ApiInternalApprovalsDecideRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -214,6 +224,7 @@ export interface FileRouteTypes {
     | '/api/oauth/token'
     | '/api/rest/tool'
     | '/api/telegram/webhook'
+    | '/api/internal/approvals/decide'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
@@ -235,6 +246,7 @@ export interface FileRouteTypes {
     | '/api/oauth/token'
     | '/api/rest/tool'
     | '/api/telegram/webhook'
+    | '/api/internal/approvals/decide'
   id:
     | '__root__'
     | '/'
@@ -256,6 +268,7 @@ export interface FileRouteTypes {
     | '/api/oauth/token'
     | '/api/rest/tool'
     | '/api/telegram/webhook'
+    | '/api/internal/approvals/decide'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -277,6 +290,7 @@ export interface RootRouteChildren {
   ApiOauthTokenRoute: typeof ApiOauthTokenRoute
   ApiRestToolRoute: typeof ApiRestToolRoute
   ApiTelegramWebhookRoute: typeof ApiTelegramWebhookRoute
+  ApiInternalApprovalsDecideRoute: typeof ApiInternalApprovalsDecideRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -414,6 +428,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiTelegramWebhookRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/api/internal/approvals/decide': {
+      id: '/api/internal/approvals/decide'
+      path: '/api/internal/approvals/decide'
+      fullPath: '/api/internal/approvals/decide'
+      preLoaderRoute: typeof ApiInternalApprovalsDecideRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
@@ -453,6 +474,7 @@ const rootRouteChildren: RootRouteChildren = {
   ApiOauthTokenRoute: ApiOauthTokenRoute,
   ApiRestToolRoute: ApiRestToolRoute,
   ApiTelegramWebhookRoute: ApiTelegramWebhookRoute,
+  ApiInternalApprovalsDecideRoute: ApiInternalApprovalsDecideRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
