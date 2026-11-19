@@ -77,6 +77,7 @@ export const DETECTORS = [
   { id: "sendgrid_key", provider: "sendgrid.com", re: /\b(SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,})/g },
   { id: "twilio_api_key", provider: "twilio.com", re: /\b(SK[0-9a-f]{32})\b/g },
   { id: "telegram_bot_token", provider: "telegram.org", re: /\b(\d{8,10}:AA[A-Za-z0-9_-]{33})\b/g },
+  { id: "facebook_page_token", provider: "facebook.com", re: /\b(EAA[A-Za-z0-9]{100,})\b/g },
   { id: "huggingface_token", provider: "huggingface.co", re: /\b(hf_[A-Za-z0-9]{30,})\b/g },
   { id: "npm_token", provider: "npmjs.com", re: /\b(npm_[A-Za-z0-9]{36})\b/g },
   { id: "elevenlabs_key", provider: "elevenlabs.io", re: /\b(sk_[0-9a-f]{48})\b/g },

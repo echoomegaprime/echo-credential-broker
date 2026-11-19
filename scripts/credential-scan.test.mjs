@@ -21,6 +21,7 @@ const SECRETS = {
   aws: "AKIA" + "QWERTYUIOPASDFGH",
   stripe: "sk_" + "live_" + "9aB8cD7eF6gH5iJ4kL3mN2oP",
   telegram: "1234567890:AA" + "Hk3Lm9Qw2Er5Ty8Ui1Op4As7Df0Gh3Jk6",
+  facebook: "EAA" + rep("Qw3Er5Ty7U", 12),
   generic: "v9Kq2Lx7Rm4Tn8Wz1Yb5Cd3Fg6Hj0",
   urlpass: "S3cr3t-Pa55w0rd!x",
 };
@@ -61,6 +62,40 @@ describe("credential-scan: detection without disclosure", () => {
   it("does not double-report a provider token as a generic assignment", () => {
     const findings = scanText(`GITHUB_TOKEN=${SECRETS.github}`, KEY);
     assert.deepEqual(findings.map((f) => f.detector), ["github_token"]);
+  });
+
+  it("finds a Facebook page token standing alone (the bare-file shape), by reference only", () => {
+    const findings = scanText(SECRETS.facebook, KEY);
+    assert.equal(findings.length, 1);
+    assert.equal(findings[0].detector, "facebook_page_token");
+    assert.equal(findings[0].provider, "facebook.com");
+    assert.equal(findings[0].key_name, null);
+    assert.equal(findings[0].length, SECRETS.facebook.length);
+    assert.equal(findings[0].fingerprint, fingerprint(SECRETS.facebook, KEY));
+    assert.ok(!JSON.stringify(findings).includes(SECRETS.facebook), "a finding leaked a secret value");
+  });
+
+  it("finds a Facebook page token in an assignment, named by its variable, not double-reported", () => {
+    const findings = scanText(`FB_PAGE_TOKEN=${SECRETS.facebook}`, KEY);
+    assert.deepEqual(findings.map((f) => f.detector), ["facebook_page_token"]);
+    assert.equal(findings[0].key_name, "FB_PAGE_TOKEN");
+  });
+
+  it("ignores near-miss EAA strings", () => {
+    const misses = [
+      "EAA" + rep("Qw3Er5Ty7U", 4), // real prefix, far too short
+      "EAA" + rep("a", 99), // one character under the minimum run
+      "xEAA" + rep("Qw3Er5Ty7U", 12), // no word boundary before the prefix
+      "EAA" + rep("Qw3Er5Ty7U", 6) + "-" + rep("Qw3Er5Ty7U", 6), // run broken by a dash
+      "EAACHECKPOINT" + rep("a", 10), // the prefix on an ordinary word
+    ];
+    for (const m of misses) {
+      assert.deepEqual(
+        scanText(m, KEY).filter((f) => f.detector === "facebook_page_token"),
+        [],
+        `near-miss matched: ${m.slice(0, 24)}`,
+      );
+    }
   });
 
   it("ignores placeholders, env references and ordinary words", () => {
@@ -162,5 +197,26 @@ describe("credential-scan: walking a tree", () => {
     const r = spawnSync(process.execPath, [SCRIPT, "--root", dir], { encoding: "utf8" });
     assert.equal(r.status, 1);
     assert.match(r.stderr, /--out/);
+  });
+});
+
+describe("credential-scan: a bare token file", () => {
+  let dir;
+  before(() => {
+    dir = mkdtempSync(join(tmpdir(), "credscan-fb-"));
+    writeFileSync(join(dir, "page_token.txt"), SECRETS.facebook + "\n");
+  });
+  after(() => rmSync(dir, { recursive: true, force: true }));
+
+  it("reports the page token by reference from a file that holds nothing else", async () => {
+    const manifest = await scan({ roots: [dir], key: KEY });
+    assert.equal(manifest.contains_secret_values, false);
+    assert.equal(manifest.findings.length, 1);
+    const f = manifest.findings[0];
+    assert.equal(f.file, "page_token.txt");
+    assert.equal(f.detector, "facebook_page_token");
+    assert.equal(f.provider, "facebook.com");
+    assert.equal(f.length, SECRETS.facebook.length);
+    assert.ok(!JSON.stringify(manifest).includes(SECRETS.facebook), "the manifest leaked a secret value");
   });
 });
