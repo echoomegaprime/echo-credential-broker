@@ -48,6 +48,13 @@ Probe: `vault_status` then `entry_list`. You should see metadata, never a token.
 
 ## 2. GPT (ChatGPT / Codex)
 
+### Private ECHO Vault plugin
+
+The ChatGPT plugin package lives in [plugins/echo-vault](../plugins/echo-vault/).
+Connect it to the hosted broker and approve the ChatGPT client on Telegram.
+The plugin requests `vault.read`. Check the connection with `vault_status`.
+Use `vault_find` to locate a named account and `credential_health` to check a supported provider using its opaque reference.
+
 ### GitHub app (code access)
 
 1. Open [ChatGPT Codex Connector](https://github.com/apps/chatgpt-codex-connector/installations/new)
