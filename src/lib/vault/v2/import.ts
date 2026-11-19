@@ -284,6 +284,7 @@ export type ImportStatus =
   | "secret_in_metadata"
   | "vault_unavailable"
   | "store_unavailable"
+  | "identity_conflict"
   | "store_failed";
 
 export interface ImportOutcome {
@@ -327,6 +328,7 @@ const STATUSES: readonly ImportStatus[] = [
   "secret_in_metadata",
   "vault_unavailable",
   "store_unavailable",
+  "identity_conflict",
   "store_failed",
 ];
 
@@ -335,9 +337,11 @@ function sha256Hex(value: string): string {
 }
 
 /**
- * Plan → entries. Safe to run twice: an identity that already exists is
- * `exists`, and a secret already held by another entry of the same site and
- * kind is `already_stored`. One failed entry never stops the rest.
+ * Plan → entries. Safe to run twice: an identity that already holds this secret
+ * is `exists`, and a secret already held by another entry of the same site and
+ * kind is `already_stored`. An identity that holds a DIFFERENT secret does not
+ * swallow the credential: it is stored under the account with the scan
+ * fingerprint appended. One failed entry never stops the rest.
  */
 export async function applyImport(plan: ImportPlan, deps: ImportDeps): Promise<ImportResult> {
   const dryRun = deps.dryRun === true;
@@ -358,19 +362,17 @@ export async function applyImport(plan: ImportPlan, deps: ImportDeps): Promise<I
     });
   };
 
-  for (const p of plan.entries) {
-    let identity: EntryMetadata | null;
+  /** True when `row` provably holds `secret`. Unreadable → false (import rather than drop). */
+  const holds = async (row: EntryMetadata, secret: string): Promise<boolean> => {
     try {
-      identity = await v.entries.findIdentity(p.site, p.account, p.kind);
+      return constantTimeEqual(sha256Hex(await v.readSecret(row)), sha256Hex(secret));
     } catch {
-      // A store outage costs this entry, not the batch.
-      done(p, "store_unavailable");
-      continue;
+      return false;
     }
-    if (identity) {
-      done(p, "exists", identity.id);
-      continue;
-    }
+  };
+
+  for (const planned of plan.entries) {
+    let p = planned;
     let secret: string | null = null;
     try {
       secret = await deps.resolveSecret(p);
@@ -378,7 +380,15 @@ export async function applyImport(plan: ImportPlan, deps: ImportDeps): Promise<I
       secret = null;
     }
     if (typeof secret !== "string" || secret.length === 0) {
-      done(p, "source_unreadable");
+      // Without the secret we can still say whether the planned identity is already there.
+      let known: EntryMetadata | null = null;
+      try {
+        known = await v.entries.findIdentity(p.site, p.account, p.kind);
+      } catch {
+        known = null;
+      }
+      if (known) done(p, "exists", known.id);
+      else done(p, "source_unreadable");
       continue;
     }
     registerSecretForRedaction(secret);
@@ -391,6 +401,40 @@ export async function applyImport(plan: ImportPlan, deps: ImportDeps): Promise<I
       continue;
     }
     const fp = secretFingerprint(secret);
+
+    // The planned account may already belong to a DIFFERENT secret (another file,
+    // another node). That is a second credential, not a duplicate: give it the
+    // fingerprint-suffixed account instead of dropping it.
+    const suffix = `-${p.scan_fingerprint.slice(0, 8)}`;
+    const accounts = p.account.endsWith(suffix) ? [p.account] : [p.account, `${p.account}${suffix}`.slice(0, 254)];
+    let outcome: "free" | "exists" | "conflict" | "store_down" = "conflict";
+    let existingId: string | undefined;
+    for (const account of accounts) {
+      let identity: EntryMetadata | null;
+      try {
+        identity = await v.entries.findIdentity(p.site, account, p.kind);
+      } catch {
+        outcome = "store_down"; // a store outage costs this entry, not the batch
+        break;
+      }
+      if (!identity) {
+        if (account !== p.account) p = { ...p, account, label: entryLabel(p.site, account, p.purpose) };
+        outcome = "free";
+        break;
+      }
+      if (await holds(identity, secret)) {
+        outcome = "exists";
+        existingId = identity.id;
+        break;
+      }
+    }
+    if (outcome !== "free") {
+      secret = null;
+      if (outcome === "exists") done(p, "exists", existingId);
+      else done(p, outcome === "store_down" ? "store_unavailable" : "identity_conflict");
+      continue;
+    }
+
     // The stored fingerprint is 32 bits: it nominates candidates, it does not prove
     // equality. Compare against the stored secret itself before calling it a duplicate.
     let candidates: EntryMetadata[];
@@ -403,13 +447,7 @@ export async function applyImport(plan: ImportPlan, deps: ImportDeps): Promise<I
     }
     let twin: EntryMetadata | null = null;
     for (const candidate of candidates) {
-      let held: string;
-      try {
-        held = await v.readSecret(candidate);
-      } catch {
-        continue; // cannot prove it is the same secret: import rather than drop a credential
-      }
-      if (constantTimeEqual(sha256Hex(held), sha256Hex(secret))) {
+      if (await holds(candidate, secret)) {
         twin = candidate;
         break;
       }
@@ -420,6 +458,7 @@ export async function applyImport(plan: ImportPlan, deps: ImportDeps): Promise<I
       continue;
     }
     if (dryRun) {
+      secret = null;
       done(p, "would_import");
       continue;
     }

@@ -51,6 +51,60 @@ Those paths are FORGE's. Elsewhere, use the `EnvironmentFile` and the node binar
 | `--only-site <site>` | Repeatable. Import these sites only. |
 | `--hmac-key-file <file>` | The node key the manifest was written with, if not the default `~/.echo-vault-scan/hmac.key`. |
 
+## Other nodes
+
+A node other than the vault host cannot run `vault-import.ts`: the importer
+needs the vault's database and backend, and the vault's environment is not
+copied to other machines. Instead the node pushes its own credentials to the
+vault, after you approve that node.
+
+Copy two files to the node, into the same folder: `scripts/credential-scan.mjs`
+and `scripts/vault-import-push.mjs`. Node 18 or newer, no install.
+
+```bash
+cd /path/to/those/two/files
+node vault-import-push.mjs --root /home/me            # preview: nothing stored
+node vault-import-push.mjs --root /home/me --apply    # import
+```
+
+On Windows, from PowerShell:
+
+```powershell
+cd C:\path\to\those\two\files
+node vault-import-push.mjs --all-drives --apply
+```
+
+What happens:
+
+1. The node scans itself (references only).
+2. You get **one Telegram prompt**: the node's name, how many credentials, preview
+   or import, and a six-character pairing code. The script prints the same code.
+   Approve only if they match a run you started.
+3. The node sends each distinct secret to the vault over HTTPS. The vault stores
+   it with the same code a local import uses, so naming, statuses and
+   de-duplication are identical.
+
+The channel is write-only: no response ever contains a secret. A session is
+bound to the node name, the count you were shown and the mode; it stays open at
+most 30 minutes and accepts at most that many credentials. The script refuses a
+vault address that is not `https` (plain `http` only for a vault on the same
+machine). The vault accepts at most 8 import prompts per hour in total.
+
+| Script result | Meaning |
+| --- | --- |
+| `approval_pending` (it waits) | You have not tapped Approve yet. |
+| `approval_denied` | You tapped Deny. Nothing was sent. |
+| `session_expired` / `session_closed` | The 30 minutes ran out, or the run already finished. Start again. |
+| `too_many_import_requests` | More than 8 prompts in the last hour. Wait and retry. |
+| `over_plan` (count) | The node tried to send more than the approved count; the extras were not stored. |
+
+One approval covers at most 2000 credentials. A node with more is sent as
+consecutive sessions in the same run, each with its own prompt and pairing code.
+
+Every item a node submits counts against the approved number, including items
+the vault rejects as malformed. A session can never make the vault hold more
+secrets than the count you approved.
+
 ## What you see
 
 stdout is one line of counts:
@@ -73,6 +127,7 @@ the reason. It holds no secret value.
 | `secret_out_of_range` | Shorter than 8 or longer than 4096 characters. |
 | `vault_unavailable` | The vault backend could not be reached. Nothing was stored for this entry. |
 | `store_unavailable` | The entry database could not be read for this entry. Nothing was stored for it; run again. |
+| `identity_conflict` | Both the planned account name and its fingerprint-suffixed form are taken by other secrets. Enter this one on a card. |
 | `store_failed` | The entry row could not be written; the secret was taken back out of the backend. |
 
 | Skipped finding | Why |
@@ -99,8 +154,13 @@ several files is one entry; the report lists every place it was found.
 
 ## Running it twice
 
-Safe. Existing identities are `exists`, an identical secret is `already_stored`,
-and one failed entry does not stop the rest.
+Safe. An entry that already holds the secret is `exists`, an identical secret
+under another account is `already_stored`, and one failed entry does not stop the
+rest.
+
+The same variable name on two nodes with two different secrets is two
+credentials. The second is stored under the account with eight characters of
+its scan fingerprint appended (`youtube_api_key-1a2b3c4d`), never dropped.
 
 ## What it does not do
 

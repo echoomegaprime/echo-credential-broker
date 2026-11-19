@@ -1,0 +1,13 @@
+{
+  "name": "echo-credential-broker",
+  "version": "2.0.0",
+  "description": "Echo Vault credential broker MCP",
+  "transport": {
+    "type": "http",
+    "endpoint": "/api/mcp"
+  },
+  "auth": {
+    "type": "oauth2",
+    "protected_resource_metadata": "/.well-known/oauth-protected-resource"
+  }
+}

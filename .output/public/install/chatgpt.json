@@ -1,0 +1,9 @@
+{
+  "name": "echo-credential-broker",
+  "mcp": {
+    "type": "http",
+    "url": "/api/mcp",
+    "auth": "oauth2"
+  },
+  "openapi": "/install/chatgpt.openapi.json"
+}

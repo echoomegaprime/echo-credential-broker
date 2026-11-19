@@ -17,6 +17,9 @@ import { Route as CardTokenRouteImport } from './routes/card/$token'
 import { Route as ConsoleIndexRouteImport } from './routes/console/index'
 import { Route as ConsoleSplatRouteImport } from './routes/console/$'
 import { Route as DotwellKnownOauthProtectedResourceSplatRouteImport } from './routes/[.]well-known/oauth-protected-resource/$'
+import { Route as ApiImportBeginRouteImport } from './routes/api/import/begin'
+import { Route as ApiImportFinishRouteImport } from './routes/api/import/finish'
+import { Route as ApiImportSubmitRouteImport } from './routes/api/import/submit'
 import { Route as ApiInjectorRedeemRouteImport } from './routes/api/injector/redeem'
 import { Route as ApiInjectorReportRouteImport } from './routes/api/injector/report'
 import { Route as ApiOauthAuthorizeRouteImport } from './routes/api/oauth/authorize'
@@ -69,6 +72,21 @@ const DotwellKnownOauthProtectedResourceSplatRoute =
     path: '/$',
     getParentRoute: () => DotwellKnownOauthProtectedResourceRoute,
   } as any)
+const ApiImportBeginRoute = ApiImportBeginRouteImport.update({
+  id: '/api/import/begin',
+  path: '/api/import/begin',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ApiImportFinishRoute = ApiImportFinishRouteImport.update({
+  id: '/api/import/finish',
+  path: '/api/import/finish',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ApiImportSubmitRoute = ApiImportSubmitRouteImport.update({
+  id: '/api/import/submit',
+  path: '/api/import/submit',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const ApiInjectorRedeemRoute = ApiInjectorRedeemRouteImport.update({
   id: '/api/injector/redeem',
   path: '/api/injector/redeem',
@@ -119,6 +137,9 @@ export interface FileRoutesByFullPath {
   '/console/$': typeof ConsoleSplatRoute
   '/console/': typeof ConsoleIndexRoute
   '/.well-known/oauth-protected-resource/$': typeof DotwellKnownOauthProtectedResourceSplatRoute
+  '/api/import/begin': typeof ApiImportBeginRoute
+  '/api/import/finish': typeof ApiImportFinishRoute
+  '/api/import/submit': typeof ApiImportSubmitRoute
   '/api/injector/redeem': typeof ApiInjectorRedeemRoute
   '/api/injector/report': typeof ApiInjectorReportRoute
   '/api/oauth/authorize': typeof ApiOauthAuthorizeRoute
@@ -137,6 +158,9 @@ export interface FileRoutesByTo {
   '/console/$': typeof ConsoleSplatRoute
   '/console': typeof ConsoleIndexRoute
   '/.well-known/oauth-protected-resource/$': typeof DotwellKnownOauthProtectedResourceSplatRoute
+  '/api/import/begin': typeof ApiImportBeginRoute
+  '/api/import/finish': typeof ApiImportFinishRoute
+  '/api/import/submit': typeof ApiImportSubmitRoute
   '/api/injector/redeem': typeof ApiInjectorRedeemRoute
   '/api/injector/report': typeof ApiInjectorReportRoute
   '/api/oauth/authorize': typeof ApiOauthAuthorizeRoute
@@ -156,6 +180,9 @@ export interface FileRoutesById {
   '/console/$': typeof ConsoleSplatRoute
   '/console/': typeof ConsoleIndexRoute
   '/.well-known/oauth-protected-resource/$': typeof DotwellKnownOauthProtectedResourceSplatRoute
+  '/api/import/begin': typeof ApiImportBeginRoute
+  '/api/import/finish': typeof ApiImportFinishRoute
+  '/api/import/submit': typeof ApiImportSubmitRoute
   '/api/injector/redeem': typeof ApiInjectorRedeemRoute
   '/api/injector/report': typeof ApiInjectorReportRoute
   '/api/oauth/authorize': typeof ApiOauthAuthorizeRoute
@@ -176,6 +203,9 @@ export interface FileRouteTypes {
     | '/console/$'
     | '/console/'
     | '/.well-known/oauth-protected-resource/$'
+    | '/api/import/begin'
+    | '/api/import/finish'
+    | '/api/import/submit'
     | '/api/injector/redeem'
     | '/api/injector/report'
     | '/api/oauth/authorize'
@@ -194,6 +224,9 @@ export interface FileRouteTypes {
     | '/console/$'
     | '/console'
     | '/.well-known/oauth-protected-resource/$'
+    | '/api/import/begin'
+    | '/api/import/finish'
+    | '/api/import/submit'
     | '/api/injector/redeem'
     | '/api/injector/report'
     | '/api/oauth/authorize'
@@ -212,6 +245,9 @@ export interface FileRouteTypes {
     | '/console/$'
     | '/console/'
     | '/.well-known/oauth-protected-resource/$'
+    | '/api/import/begin'
+    | '/api/import/finish'
+    | '/api/import/submit'
     | '/api/injector/redeem'
     | '/api/injector/report'
     | '/api/oauth/authorize'
@@ -230,6 +266,9 @@ export interface RootRouteChildren {
   CardTokenRoute: typeof CardTokenRoute
   ConsoleSplatRoute: typeof ConsoleSplatRoute
   ConsoleIndexRoute: typeof ConsoleIndexRoute
+  ApiImportBeginRoute: typeof ApiImportBeginRoute
+  ApiImportFinishRoute: typeof ApiImportFinishRoute
+  ApiImportSubmitRoute: typeof ApiImportSubmitRoute
   ApiInjectorRedeemRoute: typeof ApiInjectorRedeemRoute
   ApiInjectorReportRoute: typeof ApiInjectorReportRoute
   ApiOauthAuthorizeRoute: typeof ApiOauthAuthorizeRoute
@@ -297,6 +336,27 @@ declare module '@tanstack/react-router' {
       fullPath: '/.well-known/oauth-protected-resource/$'
       preLoaderRoute: typeof DotwellKnownOauthProtectedResourceSplatRouteImport
       parentRoute: typeof DotwellKnownOauthProtectedResourceRoute
+    }
+    '/api/import/begin': {
+      id: '/api/import/begin'
+      path: '/api/import/begin'
+      fullPath: '/api/import/begin'
+      preLoaderRoute: typeof ApiImportBeginRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/import/finish': {
+      id: '/api/import/finish'
+      path: '/api/import/finish'
+      fullPath: '/api/import/finish'
+      preLoaderRoute: typeof ApiImportFinishRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/import/submit': {
+      id: '/api/import/submit'
+      path: '/api/import/submit'
+      fullPath: '/api/import/submit'
+      preLoaderRoute: typeof ApiImportSubmitRouteImport
+      parentRoute: typeof rootRouteImport
     }
     '/api/injector/redeem': {
       id: '/api/injector/redeem'
@@ -382,6 +442,9 @@ const rootRouteChildren: RootRouteChildren = {
   CardTokenRoute: CardTokenRoute,
   ConsoleSplatRoute: ConsoleSplatRoute,
   ConsoleIndexRoute: ConsoleIndexRoute,
+  ApiImportBeginRoute: ApiImportBeginRoute,
+  ApiImportFinishRoute: ApiImportFinishRoute,
+  ApiImportSubmitRoute: ApiImportSubmitRoute,
   ApiInjectorRedeemRoute: ApiInjectorRedeemRoute,
   ApiInjectorReportRoute: ApiInjectorReportRoute,
   ApiOauthAuthorizeRoute: ApiOauthAuthorizeRoute,

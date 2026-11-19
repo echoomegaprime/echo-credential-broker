@@ -190,6 +190,24 @@ describe("vault import: applying", () => {
     assert.equal((await w.entries.list({})).length, 1);
   });
 
+  it("an account name already taken by a different secret does not swallow the credential", async () => {
+    const w = world();
+    const first = { "/a/.env": `GITHUB_TOKEN=${SECRETS.github}` };
+    await applyImport(planImport(manifestOf(first)), { ...w.deps, resolveSecret: resolverOf(first) });
+    // Another node, same variable name, a different token.
+    const second = { "/b/.env": `GITHUB_TOKEN=${SECRETS.github2}` };
+    const res = await applyImport(planImport(manifestOf(second)), { ...w.deps, resolveSecret: resolverOf(second) });
+    assert.equal(res.counts.imported, 1);
+    assert.equal(res.counts.exists, 0);
+    const accounts = (await w.entries.list({ site: "github.com" })).map((e) => e.account).sort();
+    assert.deepEqual(accounts, ["github_token", `github_token-${fingerprint(SECRETS.github2, KEY).slice(0, 8)}`]);
+    // And running that second import again is a no-op.
+    const again = await applyImport(planImport(manifestOf(second)), { ...w.deps, resolveSecret: resolverOf(second) });
+    assert.equal(again.counts.exists, 1);
+    assert.equal(again.counts.imported, 0);
+    assert.equal((await w.entries.list({})).length, 2);
+  });
+
   it("a fingerprint collision is not treated as the same secret", async () => {
     // Force every entry of the site to share the short fingerprint, as a 32-bit collision would.
     class CollidingStore extends MemoryEntryStore {
