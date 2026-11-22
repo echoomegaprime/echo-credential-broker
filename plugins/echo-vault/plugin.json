@@ -1,0 +1,21 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "echo-vault",
+  "version": "1.0.0",
+  "description": "Use Echo Vault from ChatGPT to find credential references and check account health through the broker.",
+  "author": { "name": "Echo Prime Technologies" },
+  "repository": "https://github.com/echoomegaprime/echo-credential-broker",
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "ECHO Vault",
+        "shortDescription": "Check vault and account health",
+        "longDescription": "Find a credential by service or account and ask the broker to verify it. The broker keeps the credential value on the server and applies the owner's access policy.",
+        "developerName": "Echo Prime Technologies",
+        "logo": "./assets/vault.svg",
+        "composerIcon": "./assets/vault.svg",
+        "defaultPrompt": "Check my vault connection using vault_status."
+      }
+    }
+  }
+}
