@@ -21,14 +21,16 @@ if (!process.env.NODE_TEST_CONTEXT) {
 export async function vaultStatus(ctx: BrokerContext): Promise<ToolResult> {
   const store = ctx.store ?? getStore();
   if (!ctx.store) await ensureImported();
-  const report = ctx.store
-    ? { imported: store.listMetadata().map((m) => m.ref), skipped: [] as string[] }
-    : await ensureImported();
+  // Search-backed census: status must agree with vault_find, which reads
+  // Vault A directly — not just with this process's local metadata cache
+  // (the 2026-11-24 defect: credential_count 0 on a cold process while find
+  // located every credential). Throttled inside the store.
+  await store.syncFromVault();
   return redactValue({
     ok: true as const,
     data: {
       invariant: INVARIANT,
-      imported: report.imported,
+      imported: store.listMetadata().map((m) => m.ref),
       credential_count: store.count(),
       redaction: "armed",
       fail_closed: true,
@@ -41,6 +43,8 @@ export async function vaultStatus(ctx: BrokerContext): Promise<ToolResult> {
 export async function vaultList(ctx: BrokerContext): Promise<ToolResult> {
   const store = ctx.store ?? getStore();
   if (!ctx.store) await ensureImported();
+  // Same census as vaultStatus — list and find must agree (see above).
+  await store.syncFromVault();
   return redactValue({
     ok: true as const,
     data: { credentials: store.listMetadata() },
@@ -74,7 +78,10 @@ export async function vaultMetadata(
   if (!parsed) {
     return { ok: false, error: "invalid_credential_ref", credential_ref };
   }
-  const meta = store.getMetadata(parsed.raw);
+  // Discover-on-miss: a cache miss LOCATES the ref in Vault A (metadata
+  // only) instead of reporting a credential the vault actually holds as
+  // unavailable just because this process never cached it.
+  const meta = await store.getMetadataOrDiscover(parsed.raw);
   if (!meta) {
     return { ok: false, error: "credential_unavailable", credential_ref: parsed.raw };
   }

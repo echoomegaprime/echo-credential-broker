@@ -1,12 +1,14 @@
 import type { ProviderId, VaultRef } from "./types.ts";
 
-const PROVIDERS = new Set<ProviderId>([
+export const PROVIDER_IDS: readonly ProviderId[] = [
   "github",
   "cloudflare",
   "openai",
   "stripe",
   "xai",
-]);
+];
+
+const PROVIDERS = new Set<ProviderId>(PROVIDER_IDS);
 
 const REF_RE = /^vault:\/\/([a-z0-9-]+)\/([a-zA-Z0-9._-]+)$/;
 

@@ -22,13 +22,16 @@
  * The public interface (put/getMetadata/listMetadata/updateMetadata/
  * resolveSecret/revoke/has/count) is UNCHANGED so broker.ts / tools.ts /
  * providers.ts need no changes at all — this is a pure backend swap.
+ * (`syncFromVault` / `getMetadataOrDiscover` were added later so the
+ * reporting tools can enumerate the canonical store instead of trusting
+ * this process's cache — see their doc comments.)
  */
 import { registerSecretForRedaction } from "./redaction.ts";
 import { GateVaultBackend, type VaultBackend } from "./backend.ts";
 import { GateUnavailableError } from "./gate-client.ts";
 import { log } from "./log.ts";
 import type { CredentialMetadata, CredentialType, ProviderId } from "./types.ts";
-import { formatVaultRef, parseVaultRef } from "./refs.ts";
+import { formatVaultRef, parseVaultRef, PROVIDER_IDS } from "./refs.ts";
 
 export interface PutCredentialInput {
   provider: ProviderId;
@@ -47,9 +50,14 @@ interface LocalRecord {
 const BYPASS_REASON =
   "echo-credential-broker: agent-facing opaque vault:// handle resolves through the canonical Master Vault; the raw secret is used server-side for one allowlisted provider call and never returned across the MCP/HTTP boundary.";
 
+/** How long a completed census stays fresh before status/list re-search Vault A. */
+const CENSUS_TTL_MS = 30_000;
+
 export class CredentialStore {
   private readonly records = new Map<string, LocalRecord>();
   private readonly backend: VaultBackend;
+  private lastCensusAt = 0;
+  private censusInFlight: Promise<string[]> | null = null;
 
   /**
    * @param backend Defaults to the REAL canonical vault (GateVaultBackend).
@@ -103,6 +111,92 @@ export class CredentialStore {
   getMetadata(ref: string): CredentialMetadata | null {
     const rec = this.records.get(ref);
     return rec ? { ...rec.meta } : null;
+  }
+
+  /**
+   * Metadata with discover-on-miss: a cache miss LOCATES the ref in the
+   * canonical vault (metadata only — no secret fetch) and registers it, so a
+   * single metadata call can repopulate a ref this process has never seen.
+   * Returns null only when the vault genuinely does not hold the ref (or the
+   * gate is unavailable — fail closed, never fabricate).
+   */
+  async getMetadataOrDiscover(ref: string): Promise<CredentialMetadata | null> {
+    const hit = this.getMetadata(ref);
+    if (hit) return hit;
+    const rec = await this.discover(ref);
+    return rec ? { ...rec.meta } : null;
+  }
+
+  /**
+   * Census — register metadata for every credential the canonical vault
+   * actually holds for the broker's providers, enumerating via backend
+   * SEARCH (the same source `find()` reads), never exact-coordinate guesses.
+   *
+   * This exists because `count()` / `listMetadata()` read only this
+   * process's local cache, which used to be populated solely by this
+   * process's own `put()` calls and a one-shot locate() of five hardcoded
+   * default refs. After a restart, credentials that live in Vault A under
+   * any other coordinates were invisible to vault_status / vault_list while
+   * vault_find found them. The census makes status/list agree with find.
+   *
+   * Metadata only — no secret is ever fetched. Existing records (e.g. from
+   * `put()`, which knows the real coordinate and type) are never overwritten.
+   * Throttled by CENSUS_TTL_MS and de-duplicated while in flight; a failed
+   * search for one provider is logged and skipped, never fabricated, and the
+   * freshness timestamp only advances when at least one search succeeded.
+   *
+   * @returns the refs registered from the vault by this census.
+   */
+  async syncFromVault(options?: { force?: boolean; maxAgeMs?: number }): Promise<string[]> {
+    const maxAgeMs = options?.maxAgeMs ?? CENSUS_TTL_MS;
+    if (!options?.force && Date.now() - this.lastCensusAt < maxAgeMs) {
+      return this.listMetadata().map((m) => m.ref);
+    }
+    if (this.censusInFlight) return this.censusInFlight;
+    const run = (async (): Promise<string[]> => {
+      let anySuccess = false;
+      const refs: string[] = [];
+      for (const provider of PROVIDER_IDS) {
+        let result: Awaited<ReturnType<VaultBackend["search"]>>;
+        try {
+          result = await this.backend.search(provider, BYPASS_REASON);
+        } catch (err) {
+          log.warn("census_search_failed", { provider, message: (err as Error).message });
+          continue;
+        }
+        anySuccess = true;
+        for (const cand of result.candidates ?? []) {
+          const ref = formatVaultRef(provider, cand.username);
+          if (!parseVaultRef(ref)) continue; // username cannot be a vault:// account — not addressable as a ref
+          if (!this.records.has(ref)) {
+            const meta: CredentialMetadata = {
+              ref,
+              provider,
+              account: cand.username,
+              type: "api_key",
+              status: "imported",
+              last_verified: null,
+              fingerprint: null,
+              source: `vault:${cand.actual_service}/${cand.username}`,
+            };
+            this.records.set(ref, {
+              meta,
+              coordinate: { service: cand.actual_service, username: cand.username },
+            });
+          }
+          refs.push(ref);
+        }
+      }
+      if (anySuccess) this.lastCensusAt = Date.now();
+      log.info("census_synced", { registered: refs.length });
+      return [...new Set(refs)];
+    })();
+    this.censusInFlight = run;
+    try {
+      return await run;
+    } finally {
+      if (this.censusInFlight === run) this.censusInFlight = null;
+    }
   }
 
   listMetadata(): CredentialMetadata[] {
@@ -217,6 +311,8 @@ export class CredentialStore {
 
   clear(): void {
     this.records.clear();
+    this.lastCensusAt = 0;
+    this.censusInFlight = null;
   }
 }
 
