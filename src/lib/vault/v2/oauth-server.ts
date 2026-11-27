@@ -103,7 +103,12 @@ const MAX_BODY_BYTES = 16 * 1024;
 const MAX_CLIENT_NAME = 100;
 const MAX_REDIRECT_URIS = 10;
 const MAX_REDIRECT_URI_LENGTH = 2048;
-const MAX_STATE_LENGTH = 1024;
+// State is opaque to us: we store it on the pending record (a text column)
+// and echo it back byte-for-byte. RFC 6749 sets no length bound, and real
+// clients exceed the old 1024 cap — Google's Gemini custom-connector flow
+// issues multi-kilobyte state values and was rejected with "state is too
+// long". 8192 leaves generous headroom while still bounding the value.
+const MAX_STATE_LENGTH = 8192;
 
 const B64URL_256 = "[A-Za-z0-9_-]{43}";
 export const ACCESS_TOKEN_RE = new RegExp(`^eva_${B64URL_256}$`);

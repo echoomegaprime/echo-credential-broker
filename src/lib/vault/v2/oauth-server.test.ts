@@ -576,6 +576,34 @@ describe("authorization endpoint", () => {
     assert.equal(new URL(plain.headers.get("location") ?? "").searchParams.get("error"), "invalid_request");
   });
 
+  it("accepts a multi-kilobyte state (Gemini-sized) and echoes it back exactly", async () => {
+    const longState = `gemini-state-${"x".repeat(6000)}`;
+    const { challenge } = pkce();
+    const res = await authorize(authParams(clientId, challenge, { state: longState }));
+    assert.equal(res.status, 200);
+    const pollUrl = pollUrlFrom(await res.text());
+    h.approver.decideLast("approved");
+    const done = await poll(pollUrl);
+    assert.equal(done.status, 302);
+    const loc = new URL(done.headers.get("location") ?? "");
+    assert.equal(loc.searchParams.get("state"), longState);
+  });
+
+  it("still accepts a request with no state (state is optional; PKCE binds the flow)", async () => {
+    const params = authParams(clientId, pkce().challenge);
+    delete params.state;
+    const res = await authorize(params);
+    assert.equal(res.status, 200);
+    assert.match(await res.text(), /Approve this connection on your phone/);
+  });
+
+  it("still rejects a state beyond the raised cap", async () => {
+    const res = await authorize(authParams(clientId, pkce().challenge, { state: "y".repeat(8193) }));
+    assert.equal(res.status, 400);
+    assert.match(await res.text(), /state is too long/);
+    assert.equal(h.approver.requests.length, 0);
+  });
+
   it("fails closed (503) when no OwnerApprover is wired", async () => {
     configureOAuth({ approver: null });
     const res = await authorize(authParams(clientId, pkce().challenge));
